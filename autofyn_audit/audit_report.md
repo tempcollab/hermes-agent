@@ -4,13 +4,13 @@
 **Target:** Hermes Agent (https://github.com/NousResearch/hermes-agent)  
 **Commit:** 124da27  
 **Date:** 2026-04-28  
-**Status:** Round 2 - 6 Critical/High Vulnerabilities Confirmed
+**Status:** Round 3 - 9 Critical/High Vulnerabilities Confirmed
 
 ---
 
 ## Executive Summary
 
-This audit identified **6 critical/high severity vulnerabilities** in Hermes Agent. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
+This audit identified **9 critical/high severity vulnerabilities** in Hermes Agent. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
 
 | ID | Vulnerability | Severity | CVSS | Status |
 |----|--------------|----------|------|--------|
@@ -20,6 +20,9 @@ This audit identified **6 critical/high severity vulnerabilities** in Hermes Age
 | HAG-004 | MCP Database Template SQL Injection | High | 8.6 | Confirmed |
 | HAG-005 | ClawHub SSRF via rawUrl | High | 7.5 | Confirmed |
 | HAG-006 | Vision Tool Local File Disclosure | High | 7.5 | Confirmed |
+| HAG-007 | Snapshot Restore Manifest Path Traversal | High | 7.8 | Confirmed |
+| HAG-008 | FileSync sync-back Host Path Traversal | High | 7.8 | Confirmed |
+| HAG-009 | HERMES_LOCAL_STT_COMMAND Template Injection RCE | Critical | 9.3 | Confirmed |
 
 ---
 
@@ -360,22 +363,161 @@ bash run_all_exploits.sh
 
 ```
 autofyn_audit/
-  setup.sh                              # Environment setup
-  teardown.sh                           # Cleanup
-  run_all_exploits.sh                   # Run all exploits
-  audit_report.md                       # This report
+  setup.sh                                      # Environment setup
+  teardown.sh                                   # Cleanup
+  run_all_exploits.sh                           # Run all exploits
+  audit_report.md                               # This report
   exploits/
-    exploit_tui_shell_exec.py           # HAG-001 PoC
-    exploit_plugin_yaml_rce.py          # HAG-002 PoC
-    exploit_docker_env_injection.py     # HAG-003 PoC
-    exploit_mcp_sql_injection.py        # HAG-004 PoC
-    exploit_clawhub_ssrf.py             # HAG-005 PoC
-    exploit_vision_file_read.py         # HAG-006 PoC
+    exploit_tui_shell_exec.py                   # HAG-001 PoC
+    exploit_plugin_yaml_rce.py                  # HAG-002 PoC
+    exploit_docker_env_injection.py             # HAG-003 PoC
+    exploit_mcp_sql_injection.py                # HAG-004 PoC
+    exploit_clawhub_ssrf.py                     # HAG-005 PoC
+    exploit_vision_file_read.py                 # HAG-006 PoC
+    exploit_snapshot_path_traversal.py          # HAG-007 PoC
+    exploit_filesync_path_traversal.py          # HAG-008 PoC
+    exploit_stt_command_injection.py            # HAG-009 PoC
   payloads/
-    evil_plugin.yaml                    # Malicious plugin payload
+    evil_plugin.yaml                            # Malicious plugin payload
   results/
-    .gitkeep                            # Runtime results directory
+    .gitkeep                                    # Runtime results directory
 ```
+
+---
+
+### HAG-007: Snapshot Restore Manifest Path Traversal
+
+**Severity:** High (CVSS 7.8)
+**File:** `hermes_cli/backup.py:631-647`
+**Attack Vector:** Local (malicious snapshot directory)
+
+#### Description
+
+`restore_quick_snapshot()` iterates the `"files"` keys in `manifest.json` and constructs destination paths as `home / rel` where `rel` is the untrusted key from the manifest. No path normalisation or containment check is performed. An attacker who can write a crafted snapshot directory (or poison an existing one) can overwrite arbitrary files outside `hermes_home`.
+
+#### Vulnerable Code
+
+```python
+for rel in meta.get("files", {}):
+    src = snap_dir / rel
+    if not src.exists():
+        continue
+    dst = home / rel  # VULN: rel unsanitized — can contain ../../
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+```
+
+#### Attack Scenario
+
+1. Attacker writes a malicious snapshot under `~/.hermes/state-snapshots/evil_snap/`
+2. `manifest.json` contains `{"files": {"../../etc/cron.d/backdoor": {}}}` (or any target path)
+3. The matching source file is placed at `evil_snap/../../etc/cron.d/backdoor`
+4. `restore_quick_snapshot("evil_snap")` copies the payload to `/etc/cron.d/backdoor`
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_snapshot_path_traversal.py
+```
+
+**Result:** File written at `/tmp/pwned_snapshot.txt` (outside the temp `hermes_home`)
+
+#### Remediation
+
+1. Resolve each `rel` path and verify it is under `home` using `Path.relative_to()` before writing
+2. Reject any manifest entry whose normalised path contains `..` components
+3. Use `validate_within_dir()` from `path_security.py`
+
+---
+
+### HAG-008: FileSync sync-back Host Path Traversal
+
+**Severity:** High (CVSS 7.8)
+**File:** `tools/environments/file_sync.py:389-392`
+**Attack Vector:** Remote sandbox (malicious file paths written inside container)
+
+#### Description
+
+`_infer_host_path()` maps a new remote file path to its host equivalent using a string prefix substitution. Only the remote directory prefix is validated (`startswith`); the suffix is appended to the host directory verbatim. A remote file whose path contains `../` after the matched prefix escapes the intended host directory.
+
+#### Vulnerable Code
+
+```python
+if remote_path.startswith(remote_dir + "/"):
+    host_dir = str(Path(host).parent)
+    suffix = remote_path[len(remote_dir):]  # VULN: suffix can traverse
+    return host_dir + suffix
+```
+
+#### Attack Scenario
+
+1. Remote sandbox creates a file at `/root/.hermes/skills/../../../etc/passwd`
+2. `_infer_host_path()` maps it to `~/.hermes/skills/../../../etc/passwd`
+3. `shutil.copy2(staged_file, host_path)` overwrites `/etc/passwd` on the host
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_filesync_path_traversal.py
+```
+
+**Result:** Inferred host path resolves outside the skills directory, demonstrating arbitrary host path reachability.
+
+#### Remediation
+
+1. Resolve `return host_dir + suffix` via `Path(host_dir + suffix).resolve()` and verify it stays under the intended host base directory
+2. Reject any remote path containing `..` components before processing
+
+---
+
+### HAG-009: HERMES_LOCAL_STT_COMMAND Template Injection (RCE)
+
+**Severity:** Critical (CVSS 9.3)
+**File:** `tools/transcription_tools.py:142-145, 484-490`
+**Attack Vector:** Local (environment variable — process environment or `.env` file)
+
+#### Description
+
+`_get_local_command_template()` returns `HERMES_LOCAL_STT_COMMAND` verbatim. `_transcribe_local_command()` calls `.format()` on it to substitute quoted audio file paths, then passes the result to `subprocess.run(..., shell=True)`. The `.format()` quoting applies only to the substituted values — the template itself is arbitrary shell code. An attacker who can set the environment variable achieves RCE whenever transcription is triggered.
+
+#### Vulnerable Code
+
+```python
+configured = os.getenv(LOCAL_STT_COMMAND_ENV, "").strip()
+if configured:
+    return configured  # VULN: returned verbatim, no validation
+
+# ...
+command = command_template.format(
+    input_path=shlex.quote(prepared_input),
+    ...
+)
+subprocess.run(command, shell=True, check=True, ...)
+```
+
+#### Attack Scenario
+
+1. Attacker sets `HERMES_LOCAL_STT_COMMAND="id > /tmp/pwned.txt; echo {input_path}"`
+2. Any voice message or audio transcription call triggers `_transcribe_local_command()`
+3. Shell parses the command as two statements: `id > /tmp/pwned.txt` then `echo '/tmp/audio.wav'`
+4. Arbitrary command runs with the process's privileges
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_stt_command_injection.py
+```
+
+**Result:** Creates `/tmp/pwned_stt.txt` containing `uid=1000(agentuser)...`
+
+#### Remediation
+
+1. Validate `HERMES_LOCAL_STT_COMMAND` against an allowlist of safe characters (e.g., alphanumeric, `/`, `-`, `_`, `.`, `{`, `}`) before accepting it
+2. Or better: require the template to be a whitespace-separated argument list and use `subprocess.run([...], shell=False)` after substitution
+3. Consider disallowing env-var-configured shell templates entirely; use a fixed binary path
 
 ---
 
@@ -392,10 +534,11 @@ The following vulnerabilities were identified during code analysis but require f
 
 Hermes Agent contains multiple critical vulnerabilities across different attack surfaces:
 
-1. **Command Injection (HAG-001, HAG-002, HAG-003):** Consistent use of `shell=True` with unsanitized input
+1. **Command Injection (HAG-001, HAG-002, HAG-003, HAG-009):** Consistent use of `shell=True` with unsanitized input, including env-var-controlled shell templates
 2. **SQL Injection (HAG-004):** Insufficient validation of user-supplied SQL in MCP template
 3. **SSRF (HAG-005):** Missing `is_safe_url()` checks in skill installation flow
 4. **File Disclosure (HAG-006):** No path restriction on local file reads in vision tool
+5. **Path Traversal (HAG-007, HAG-008):** Missing `..` component sanitisation in snapshot restore and file-sync sync-back
 
 **Immediate Actions Required:**
 1. Audit all `shell=True` usages and convert to `shell=False` with explicit argument lists
@@ -405,6 +548,7 @@ Hermes Agent contains multiple critical vulnerabilities across different attack 
 5. Apply `is_safe_url()` checks consistently across all URL-fetching code paths
 6. Implement path restrictions for local file access in vision tools
 7. Use parameterized queries or proper SQL parsing for database access
+8. Sanitise all manifest/metadata-derived file paths through `Path.resolve()` and containment checks before any file write operation
 
 ---
 
