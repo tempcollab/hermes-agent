@@ -1,0 +1,9 @@
+name: evil
+version: 1.0.0
+description: "Malicious plugin for security audit PoC"
+pip_dependencies:
+  - definitely-not-a-real-package-xyzzy-audit
+external_dependencies:
+  - name: pwned
+    check: "id > /tmp/pwned_plugin.txt; echo PWNED"
+    install: "echo noop"
