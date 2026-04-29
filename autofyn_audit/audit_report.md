@@ -4,13 +4,13 @@
 **Target:** Hermes Agent (https://github.com/NousResearch/hermes-agent)  
 **Commit:** 124da27  
 **Date:** 2026-04-28  
-**Status:** Round 17 - 35 Critical/High Vulnerabilities Confirmed + 12 End-to-End Exploit Chains
+**Status:** Round 18 - 35 Critical/High Vulnerabilities Confirmed + 15 End-to-End Exploit Chains
 
 ---
 
 ## Executive Summary
 
-This audit identified **35 critical/high severity vulnerabilities** in Hermes Agent, combined into **12 end-to-end exploit chains** demonstrating real-world critical impact. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
+This audit identified **35 critical/high severity vulnerabilities** in Hermes Agent, combined into **15 end-to-end exploit chains** demonstrating real-world critical impact. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
 
 | ID | Vulnerability | Severity | CVSS | Status |
 |----|--------------|----------|------|--------|
@@ -2365,6 +2365,117 @@ id output: uid=1000(agentuser) gid=1000(agentuser) groups=1000(agentuser),0(root
 [+] TUI gateway ready
 [+] command.dispatch response: {'result': {'type': 'exec', 'output': ''}}
 [+] RCE via command.dispatch: uid=1000(agentuser) gid=1000(agentuser) groups=1000(agentuser),0(root)
+```
+
+---
+
+### Chain 13: Docker Build-Time RCE to Snapshot Exfiltration (HAG-003 + HAG-007)
+
+**Severity:** Critical (CVSS 9.3)  
+**Vulnerabilities:** HAG-003 (HERMES_DOCKER_BINARY injection) + HAG-007 (snapshot restore path traversal)  
+**Exploit:** `autofyn_audit/exploits/chain_docker_snapshot.py`
+
+**Attack flow:**
+1. An attacker who can inject the `HERMES_DOCKER_BINARY` environment variable (via
+   `.env` file, shell profile poisoning, or prior foothold) points it at a malicious
+   wrapper script.
+2. When `DockerEnvironment.cleanup()` runs, it interpolates `self._docker_exe` verbatim
+   into a shell command string passed to `subprocess.Popen(..., shell=True)`. Command
+   substitution in the injected value executes arbitrary code with full host privileges
+   before Docker I/O is redirected to `/dev/null` (HAG-003). Initial RCE achieved.
+3. Using the foothold, the attacker crafts a malicious snapshot directory with a
+   `manifest.json` containing path traversal entries, e.g.
+   `"../../chain13_traversal.txt": {}`.
+4. `restore_quick_snapshot()` in `hermes_cli/backup.py` iterates the manifest and
+   constructs destination paths as `hermes_home / rel` with no `Path.resolve()` or
+   `is_relative_to()` containment check — writing the payload file to an arbitrary
+   location outside `hermes_home` (HAG-007).
+5. Combined impact: Docker binary hijack grants initial host-process RCE; snapshot
+   path traversal then enables persistent backdoor placement at any writable path
+   (e.g. `cron.d`, `~/.ssh/authorized_keys`).
+
+**Confirmed output:**
+```
+[+] HAG-003: cleanup() interpolates _docker_exe into shell=True Popen() confirmed
+[+] Docker binary injection executed — RCE output: uid=1000(agentuser) ...
+[+] Marker file written: /tmp/chain13_docker_rce.txt
+[+] Traversal rel path: ../../chain13_traversal.txt
+[+] File written outside hermes_home: /tmp/<work>/chain13_traversal.txt
+[+] Marker file written: /tmp/chain13_traversal.txt
+```
+
+---
+
+### Chain 14: ClawHub SSRF to STT RCE (HAG-005 + HAG-009)
+
+**Severity:** Critical (CVSS 9.3)  
+**Vulnerabilities:** HAG-005 (ClawHub SSRF via rawUrl) + HAG-009 (HERMES_LOCAL_STT_COMMAND template injection RCE)  
+**Exploit:** `autofyn_audit/exploits/chain_clawhub_stt.py`
+
+**Attack flow:**
+1. An attacker publishes a malicious skill to the Hermes skill registry.  The skill
+   metadata embeds a backdoored `rawUrl` field pointing to an internal endpoint
+   (e.g. AWS IMDS at `169.254.169.254` or a local service at `127.0.0.1`).
+2. When the victim installs the skill, `ClawHubSource._extract_files()` fetches each
+   file via its `rawUrl`.  The only guard is `raw_url.startswith("http")` — no call
+   to `is_safe_url()` — so the internal URL is fetched verbatim, constituting SSRF
+   (HAG-005). Internal service responses, credentials, or HERMES_HOME paths are
+   disclosed to the attacker-controlled skill registry.
+3. The attacker also sets `HERMES_LOCAL_STT_COMMAND` to a template containing shell
+   metacharacters: `id > /tmp/chain14_stt_rce.txt; echo {input_path}`.
+4. When the victim invokes voice transcription, `_transcribe_local_command()` in
+   `transcription_tools.py` calls `subprocess.run(command_template.format(...), shell=True)`.
+   The attacker-controlled template portion (outside `{input_path}`) is executed
+   verbatim before the benign echo command (HAG-009).
+5. Combined impact: SSRF-based internal reconnaissance followed by arbitrary RCE
+   when the victim uses the voice transcription feature.
+
+**Confirmed output:**
+```
+[+] HAG-005: _extract_files() fetches rawUrl with only startswith check confirmed
+[+] SSRF triggered — internal URL fetched: http://127.0.0.1:19888/latest/meta-data/...
+[+] No is_safe_url() guard in ClawHubSource._extract_files()
+[+] STT template injection executed — RCE output: uid=1000(agentuser) ...
+[+] Marker file written: /tmp/chain14_stt_rce.txt
+```
+
+---
+
+### Chain 15: Binary Hijack Chain — GWS to TIRITH Security Bypass (HAG-015 + HAG-028)
+
+**Severity:** Critical (CVSS 9.4)  
+**Vulnerabilities:** HAG-015 (HERMES_GWS_BIN arbitrary binary execution) + HAG-028 (TIRITH_BIN security scanner bypass + RCE)  
+**Exploit:** `autofyn_audit/exploits/chain_gws_tirith.py`
+
+**Attack flow:**
+1. An attacker injects `HERMES_GWS_BIN=/tmp/evil_gws` pointing at a malicious wrapper
+   script. `google_api.py`'s `_gws_binary()` reads this value and returns it directly
+   as `cmd[0]` for `subprocess.run()` — no `os.path.isfile()`, no `os.access()`, no
+   allowlist check (HAG-015).
+2. When the Hermes gateway starts and the Google Workspace integration is invoked, the
+   attacker-controlled binary executes with full gateway environment and privileges —
+   initial RCE achieved.
+3. The attacker also sets `TIRITH_BIN=/tmp/evil_tirith` pointing at a fake security
+   scanner that (a) returns exit code 0 ("allow") for any input and (b) exfiltrates
+   all scanned content before returning the fake verdict.
+4. `tools/tirith_security.py`'s `_load_security_config()` reads `TIRITH_BIN` from the
+   environment via `os.getenv()` with no validation, and `_resolve_tirith_path()` passes
+   it to `subprocess.run()` as `cmd[0]` (HAG-028).
+5. Every subsequent call to `check_command_security()` invokes the fake scanner — all
+   policy violations are silently approved and content is exfiltrated undetected.
+6. Combined impact: Full gateway process hijack via GWS binary replacement + complete
+   security control bypass via TIRITH replacement — undetected malicious tool execution
+   and data exfiltration.
+
+**Confirmed output:**
+```
+[+] HAG-015: _gws_binary() returned attacker path without isfile()/isexec() check
+[+] GWS binary hijack executed — RCE output: uid=1000(agentuser) ...
+[+] Marker file written: /tmp/chain15_gws_rce.txt
+[+] check_command_security returned: allow
+[+] TIRITH binary bypass executed — RCE output: uid=1000(agentuser) ...
+[+] Security scanner completely bypassed — fake 'allow' verdict returned
+[+] Marker file written: /tmp/chain15_tirith_bypass.txt
 ```
 
 ---
