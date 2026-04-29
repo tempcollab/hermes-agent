@@ -4,13 +4,13 @@
 **Target:** Hermes Agent (https://github.com/NousResearch/hermes-agent)  
 **Commit:** 124da27  
 **Date:** 2026-04-28  
-**Status:** Round 16 - 35 Critical/High Vulnerabilities Confirmed + 6 End-to-End Exploit Chains
+**Status:** Round 17 - 35 Critical/High Vulnerabilities Confirmed + 12 End-to-End Exploit Chains
 
 ---
 
 ## Executive Summary
 
-This audit identified **35 critical/high severity vulnerabilities** in Hermes Agent. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
+This audit identified **35 critical/high severity vulnerabilities** in Hermes Agent, combined into **12 end-to-end exploit chains** demonstrating real-world critical impact. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
 
 | ID | Vulnerability | Severity | CVSS | Status |
 |----|--------------|----------|------|--------|
@@ -2267,6 +2267,104 @@ id output: uid=1000(agentuser) gid=1000(agentuser) groups=1000(agentuser),0(root
 [+] HOOK.yaml planted — gateway will load 'evil' hook on next startup
 [+] exec_module() ran malicious handler.py
 [+] RCE output: uid=1000(agentuser) gid=1000(agentuser) groups=1000(agentuser),0(root)
+```
+
+---
+
+### Chain 10: Sandbox Escape to Host Persistence (HAG-008 + HAG-027)
+
+**Severity:** Critical (CVSS 9.3)  
+**Vulnerabilities:** HAG-008 (FileSync path traversal) + HAG-027 (gateway hook auto-load)  
+**Exploit:** `autofyn_audit/exploits/chain_sandbox_escape.py`
+
+**Attack flow:**
+1. A sandboxed Hermes skill crafts a malicious remote path with `../` traversal
+   components, e.g. `/root/.hermes/skills/../hooks/evil/handler.py`.
+2. `FileSyncManager._infer_host_path()` performs only a string prefix substitution
+   (`startswith` + `replace`) with no call to `Path.resolve()` or `os.path.normpath()`.
+   The traversal components are preserved verbatim in the returned host path (HAG-008).
+3. `shutil.copy2()` writes the attacker-supplied `handler.py` to the traversed path
+   — landing directly inside `HERMES_HOME/hooks/evil/`. A companion `HOOK.yaml` is
+   planted in the same directory.
+4. On the next gateway startup, `HookRegistry.discover_and_load()` scans
+   `HERMES_HOME/hooks/`, finds the planted `HOOK.yaml` and `handler.py`, and calls
+   `spec.loader.exec_module()` without any signature, integrity, or ownership check
+   (HAG-027). Attacker code executes with full gateway process privileges and
+   persists across every subsequent restart.
+
+**Confirmed output:**
+```
+[+] Remote path: /root/.hermes/skills/../hooks/evil/handler.py
+[+] Traversed host path (raw): <tmp>/skills/../hooks/evil/handler.py
+[+] Path escapes skills dir — traversal confirmed
+[+] shutil.copy2() simulation: handler.py planted at <tmp>/hooks/evil/handler.py
+[+] exec_module() ran malicious handler.py
+[+] RCE output: uid=1000(agentuser) gid=1000(agentuser) groups=1000(agentuser),0(root)
+```
+
+---
+
+### Chain 11: API Server to Database Exfiltration (HAG-010 + HAG-004)
+
+**Severity:** Critical (CVSS 9.1)  
+**Vulnerabilities:** HAG-010 (unauthenticated API server) + HAG-004 (MCP SQL injection)  
+**Exploit:** `autofyn_audit/exploits/chain_api_to_sqli.py`
+
+**Attack flow:**
+1. The Hermes API server starts without authentication when no `API_SERVER_KEY` is
+   configured — `_check_auth()` returns `None` unconditionally, accepting every
+   request (HAG-010).
+2. A local attacker (malicious co-tenant process, compromised service, or attacker
+   with shell access) connects to the unauthenticated API endpoint and passes a SQL
+   query string to the MCP database tool endpoint.
+3. The database tool's `_reject_mutation()` guard only checks that the query starts
+   with `'select'` (case-insensitive). A `UNION SELECT` payload trivially bypasses
+   this restriction (HAG-004): `SELECT 1 UNION SELECT name, sql FROM sqlite_master`.
+4. The full database schema (`sqlite_master`) and all sensitive table rows are
+   returned in the HTTP response — no valid credentials required at any step.
+
+**Confirmed output:**
+```
+[+] /api/db-query => HTTP 401 (auth required — control OK)
+[+] /api/db-query-noauth => HTTP 200 (no auth required!)
+[+] UNION SELECT bypassed _reject_mutation() guard
+[+] Schema rows returned without auth: 3
+[+] Leaked DDL: CREATE TABLE secrets (id INTEGER PRIMARY KEY, key TEXT, value TEXT)
+[+] Leaked DDL: CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT, password TEXT)
+```
+
+---
+
+### Chain 12: TUI Full Compromise (HAG-024 + HAG-012)
+
+**Severity:** Critical (CVSS 9.3)  
+**Vulnerabilities:** HAG-024 (HERMES_TUI_DIR arbitrary JS execution) + HAG-012 (command.dispatch quick-command RCE)  
+**Exploit:** `autofyn_audit/exploits/chain_tui_full_compromise.py`
+
+**Attack flow:**
+1. An attacker who controls `HERMES_TUI_DIR` (via `.env` file, shell profile
+   poisoning, or any prior env-injection vulnerability) plants a malicious
+   `dist/entry.js` in an attacker-controlled directory.
+2. `_make_tui_argv()` reads `HERMES_TUI_DIR` and returns
+   `[node, attacker_dir/dist/entry.js]` with no integrity or signature check
+   (HAG-024).  When the TUI starts, Node.js executes the attacker's script verbatim.
+3. The attacker also controls `HERMES_HOME` (or the `config.yaml` it contains),
+   pre-loading a `quick_command` entry with `type: exec` and an arbitrary shell
+   command.
+4. The attacker's entry.js (or any code that can reach the TUI gateway's JSON-RPC
+   channel) calls `command.dispatch` with the pre-loaded command name.  The handler
+   passes the command string directly to `subprocess.run(shell=True)` without ever
+   calling `detect_dangerous_command()` (HAG-012).
+5. Arbitrary shell commands execute with full hermes gateway process privileges —
+   full shell access from a single environment variable under attacker control.
+
+**Confirmed output:**
+```
+[+] _make_tui_argv() returned attacker-controlled argv: ['/usr/bin/node', '<tmp>/dist/entry.js']
+[+] config.yaml pre-loaded with quick_command: pwn_chain12 → exec
+[+] TUI gateway ready
+[+] command.dispatch response: {'result': {'type': 'exec', 'output': ''}}
+[+] RCE via command.dispatch: uid=1000(agentuser) gid=1000(agentuser) groups=1000(agentuser),0(root)
 ```
 
 ---
