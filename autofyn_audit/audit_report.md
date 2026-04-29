@@ -1,9 +1,10 @@
 # Security Audit Report: Hermes Agent
 
-**Audit Firm:** AutoFyn SignalPilot  
-**Target:** Hermes Agent (https://github.com/NousResearch/hermes-agent)  
-**Commit:** 124da27  
-**Date:** 2026-04-28  
+**Audit Firm:** AutoFyn SignalPilot
+**Audit Model:** Claude Opus 4.5 (Anthropic)
+**Target:** Hermes Agent (https://github.com/NousResearch/hermes-agent)
+**Commit:** 124da27
+**Date:** 2026-04-28
 **Status:** Round 19 - 35 Critical/High Vulnerabilities Confirmed + 18 End-to-End Exploit Chains
 
 ---
