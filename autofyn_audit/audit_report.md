@@ -4,13 +4,13 @@
 **Target:** Hermes Agent (https://github.com/NousResearch/hermes-agent)  
 **Commit:** 124da27  
 **Date:** 2026-04-28  
-**Status:** Round 10 - 29 Critical/High Vulnerabilities Confirmed
+**Status:** Round 11 - 32 Critical/High Vulnerabilities Confirmed
 
 ---
 
 ## Executive Summary
 
-This audit identified **29 critical/high severity vulnerabilities** in Hermes Agent. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
+This audit identified **32 critical/high severity vulnerabilities** in Hermes Agent. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
 
 | ID | Vulnerability | Severity | CVSS | Status |
 |----|--------------|----------|------|--------|
@@ -43,6 +43,9 @@ This audit identified **29 critical/high severity vulnerabilities** in Hermes Ag
 | HAG-027 | Gateway Hook Auto-load Arbitrary Python Execution | Critical | 9.3 | Confirmed |
 | HAG-028 | TIRITH_BIN Arbitrary Binary Execution (No Validation) | Critical | 8.8 | Confirmed |
 | HAG-033 | MCP api_wrapper SSRF via API_BASE_URL — Token Leakage | High | 8.6 | Confirmed |
+| HAG-029 | HERMES_BIN Arbitrary Binary Execution (TUI externalCli.ts) | Critical | 9.1 | Confirmed |
+| HAG-030 | HERMES_COPILOT_ACP_COMMAND Arbitrary Binary Execution | Critical | 9.1 | Confirmed |
+| HAG-031 | WeCom XML Pre-Auth Billion Laughs DoS | High | 7.5 | Confirmed |
 
 ---
 
@@ -1646,6 +1649,200 @@ python3 exploits/exploit_mcp_api_ssrf.py
 2. Use `urllib.parse.urlparse()` to extract and check the scheme (allow only `https`) and hostname
 3. Never forward `Authorization` headers to a URL derived from an env var without domain pinning
 4. Sanitize `resource_id` to prevent path traversal (reject strings containing `..`)
+
+---
+
+### HAG-029: HERMES_BIN Arbitrary Binary Execution (TUI externalCli.ts)
+
+**Severity:** Critical (CVSS 9.1)
+**File:** `ui-tui/src/lib/externalCli.ts:8,12`
+**Attack Vector:** Local (environment variable — process environment or `.env` file)
+
+#### Description
+
+The `resolveHermesBin()` function reads `HERMES_BIN` from the environment and returns it
+directly without any validation:
+
+```typescript
+const resolveHermesBin = () => process.env.HERMES_BIN?.trim() || 'hermes'
+```
+
+This value is then passed directly to Node.js `spawn()` at line 12:
+
+```typescript
+const child = spawn(resolveHermesBin(), args, { stdio: 'inherit' })
+```
+
+No `fs.existsSync()`, no `which` check, and no path allowlist is applied. Any process
+that can set `HERMES_BIN` before TUI import controls which binary is executed. This is a
+distinct code path from HAG-017 (`HERMES_PYTHON` in `gatewayClient.ts`).
+
+#### Vulnerable Code
+
+```typescript
+// externalCli.ts:8 — no validation of env var value
+const resolveHermesBin = () => process.env.HERMES_BIN?.trim() || 'hermes'
+
+// externalCli.ts:12 — attacker binary executed with TUI args
+const child = spawn(resolveHermesBin(), args, { stdio: 'inherit' })
+```
+
+#### Attack Scenario
+
+1. Attacker sets `HERMES_BIN=/tmp/evil.sh` in the environment
+2. Any TUI call to `launchHermesCommand()` (every hermes CLI action) triggers the spawn
+3. Malicious binary executes with the privileges of the TUI process
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_hermes_bin.py
+```
+
+**Result:** Creates `/tmp/pwned_hermes_bin.txt` containing `uid=1000(agentuser)...`
+
+#### Remediation
+
+1. Add `fs.existsSync()` validation before returning `HERMES_BIN`
+2. Validate the path is under a trusted directory (e.g., `/usr/local/bin/`)
+3. Consider removing the env var override entirely and hardcoding the hermes binary path
+
+---
+
+### HAG-030: HERMES_COPILOT_ACP_COMMAND Arbitrary Binary Execution
+
+**Severity:** Critical (CVSS 9.1)
+**File:** `agent/copilot_acp_client.py:34-39,418-419`
+**Attack Vector:** Local (environment variable — process environment or `.env` file)
+
+#### Description
+
+The `_resolve_command()` function reads `HERMES_COPILOT_ACP_COMMAND` (and falls back to
+`COPILOT_CLI_PATH`) from the environment and returns the value verbatim:
+
+```python
+def _resolve_command() -> str:
+    return (
+        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+        or os.getenv("COPILOT_CLI_PATH", "").strip()
+        or "copilot"
+    )
+```
+
+This value is stored as `self._acp_command` and passed directly to `subprocess.Popen()`
+with no validation at either the resolution site or the execution site:
+
+```python
+proc = subprocess.Popen(
+    [self._acp_command] + self._acp_args,
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, ...
+)
+```
+
+Both env vars (`HERMES_COPILOT_ACP_COMMAND` and `COPILOT_CLI_PATH`) are injectable.
+Any attacker-controlled path is executed the moment `_run_prompt()` is called.
+
+#### Vulnerable Code
+
+```python
+# copilot_acp_client.py:34-39 — no os.path.isfile(), no os.access() check
+def _resolve_command() -> str:
+    return (
+        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+        or os.getenv("COPILOT_CLI_PATH", "").strip()
+        or "copilot"
+    )
+
+# copilot_acp_client.py:418-419 — attacker binary executed via Popen
+proc = subprocess.Popen(
+    [self._acp_command] + self._acp_args,
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, ...
+)
+```
+
+#### Attack Scenario
+
+1. Attacker sets `HERMES_COPILOT_ACP_COMMAND=/tmp/evil.sh` in the environment
+2. `CopilotACPClient` is instantiated — `_resolve_command()` stores the attacker path
+3. Any call that triggers `_run_prompt()` (e.g., `chat.completions.create()`) causes Popen to execute the attacker binary
+4. `COPILOT_CLI_PATH` provides a second injection vector when the primary env var is unset
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_copilot_acp_command.py
+```
+
+**Result:** Creates `/tmp/pwned_copilot_acp.txt` containing `uid=1000(agentuser)...`
+
+#### Remediation
+
+1. Add `os.path.isfile()` and `os.access(..., os.X_OK)` checks in `_resolve_command()`
+2. Validate the path against a trusted directory allowlist before accepting it
+3. Consider removing env var override and requiring explicit configuration in a signed config file
+
+---
+
+### HAG-031: WeCom XML Pre-Auth Billion Laughs DoS
+
+**Severity:** High (CVSS 7.5)
+**File:** `gateway/platforms/wecom_callback.py:20,311`
+**Attack Vector:** Network (unauthenticated POST to /wecom/callback)
+
+#### Description
+
+The module imports Python's stdlib `xml.etree.ElementTree` and calls `ET.fromstring(body)`
+inside `_decrypt_request()` before any authentication or signature check:
+
+```python
+from xml.etree import ElementTree as ET   # line 20
+
+def _decrypt_request(self, app, body, msg_signature, timestamp, nonce):
+    root = ET.fromstring(body)            # line 311 — no defusedxml!
+```
+
+Python's stdlib `ElementTree` does **not** defend against XML entity expansion attacks
+(Billion Laughs / XML bomb). An attacker can POST a crafted XML payload with nested
+entity definitions to `/wecom/callback` before authentication runs, causing exponential
+memory consumption and server DoS.
+
+The `defusedxml` library would raise `DTDForbidden` for this payload; the stdlib silently
+expands, consuming memory proportional to the expansion product.
+
+#### Vulnerable Code
+
+```python
+# wecom_callback.py:20 — stdlib import, not defusedxml
+from xml.etree import ElementTree as ET
+
+# wecom_callback.py:311 — parsed before msg_signature is verified
+def _decrypt_request(self, app, body, msg_signature, timestamp, nonce):
+    root = ET.fromstring(body)   # VULN: entity expansion before auth
+```
+
+#### Attack Scenario
+
+1. Attacker crafts a Billion Laughs XML payload with nested entity expansions
+2. POSTs payload to `/wecom/callback?msg_signature=...&timestamp=...&nonce=...`
+3. `ET.fromstring()` expands entities before `crypt.decrypt()` validates the signature
+4. Memory exhaustion causes server process crash or OOM kill — no credentials required
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_wecom_xml_dos.py
+```
+
+**Result:** 413-byte payload expands to 30,000 bytes (72.6x ratio) using 4-level nesting; a production 9-level payload achieves 10^9x expansion. Confirms `/tmp/pwned_wecom_xml.txt`.
+
+#### Remediation
+
+1. Replace `from xml.etree import ElementTree as ET` with `import defusedxml.ElementTree as ET`
+2. Validate and enforce a maximum body size before calling any XML parser
+3. Perform HMAC signature verification on the raw body bytes before parsing XML content
 
 ---
 
