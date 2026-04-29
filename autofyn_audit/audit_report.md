@@ -4,13 +4,13 @@
 **Target:** Hermes Agent (https://github.com/NousResearch/hermes-agent)  
 **Commit:** 124da27  
 **Date:** 2026-04-28  
-**Status:** Round 3 - 9 Critical/High Vulnerabilities Confirmed
+**Status:** Round 4 - 11 Critical/High Vulnerabilities Confirmed
 
 ---
 
 ## Executive Summary
 
-This audit identified **9 critical/high severity vulnerabilities** in Hermes Agent. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
+This audit identified **11 critical/high severity vulnerabilities** in Hermes Agent. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
 
 | ID | Vulnerability | Severity | CVSS | Status |
 |----|--------------|----------|------|--------|
@@ -23,6 +23,8 @@ This audit identified **9 critical/high severity vulnerabilities** in Hermes Age
 | HAG-007 | Snapshot Restore Manifest Path Traversal | High | 7.8 | Confirmed |
 | HAG-008 | FileSync sync-back Host Path Traversal | High | 7.8 | Confirmed |
 | HAG-009 | HERMES_LOCAL_STT_COMMAND Template Injection RCE | Critical | 9.3 | Confirmed |
+| HAG-010 | API Server Unauthenticated Local Access | High | 7.5 | Confirmed |
+| HAG-011 | UrlSource SSRF — Missing is_safe_url() Guard | High | 7.5 | Confirmed |
 
 ---
 
@@ -377,6 +379,7 @@ autofyn_audit/
     exploit_snapshot_path_traversal.py          # HAG-007 PoC
     exploit_filesync_path_traversal.py          # HAG-008 PoC
     exploit_stt_command_injection.py            # HAG-009 PoC
+    exploit_api_server_noauth.py               # HAG-010 PoC
   payloads/
     evil_plugin.yaml                            # Malicious plugin payload
   results/
@@ -521,12 +524,115 @@ python3 exploits/exploit_stt_command_injection.py
 
 ---
 
+### HAG-010: API Server Unauthenticated Local Access
+
+**Severity:** High (CVSS 7.5)
+**File:** `gateway/platforms/api_server.py:670-673`
+**Attack Vector:** Local (any process on the same machine)
+
+#### Description
+
+The API server defaults to binding `127.0.0.1:8777`. When no `API_SERVER_KEY` is configured, `_check_auth()` returns `None` unconditionally — every request is accepted without credentials. The server emits a startup warning but does not restrict access in any way. Any local process (browser JavaScript, malicious extension, another user process) can reach the server.
+
+#### Vulnerable Code
+
+```python
+def _check_auth(self, request: "web.Request") -> Optional["web.Response"]:
+    if not self._api_key:
+        return None  # No key configured — allow all (local-only use)
+```
+
+#### Attack Scenario
+
+1. User runs `hermes gateway` without setting `API_SERVER_KEY`
+2. API server starts on `http://127.0.0.1:8777` with no authentication
+3. Any local process sends unauthenticated requests:
+   - `GET /api/jobs` → enumerates all cron jobs with prompts, schedules, delivery configs
+   - `POST /api/jobs` → creates a new exfiltration cron job
+   - `POST /v1/chat/completions` → executes arbitrary prompts via the agent
+   - `GET /v1/responses/{id}` → reads stored response history
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_api_server_noauth.py
+```
+
+**Result:** `GET http://127.0.0.1:18777/api/jobs` returns HTTP 200 with cron job data — no credentials provided or required.
+
+#### Remediation
+
+1. Require `API_SERVER_KEY` to be set before the server starts; refuse to start without one
+2. If local-only use is intended, generate a random key automatically on first run and store it in `~/.hermes/`
+3. Consider binding to a Unix socket instead of TCP for local-only deployments
+
+---
+
+### HAG-011: UrlSource SSRF — Missing is_safe_url() Guard
+
+**Severity:** High (CVSS 7.5)
+**File:** `tools/skills_hub.py:1046-1055` (UrlSource._fetch_text)
+**Attack Vector:** Network (CLI or TUI — user provides URL directly)
+
+#### Description
+
+`UrlSource._fetch_text()` calls `httpx.get(url, follow_redirects=True)` without invoking `is_safe_url()` from `tools/url_safety.py`. The only gate is `UrlSource._matches()`, which accepts any HTTP(S) URL whose path ends in `.md`. This means a user (or an attacker who can supply a URL, e.g., via prompt injection or a malicious skill) can trigger a server-side fetch to any internal address, including cloud metadata endpoints and localhost services.
+
+Every other outbound HTTP path in the codebase (vision tools, gateway adapters, media cache helpers) gates requests through `is_safe_url()`. `UrlSource` is the sole exception.
+
+#### Vulnerable Code
+
+```python
+@staticmethod
+def _fetch_text(url: str) -> Optional[str]:
+    try:
+        resp = httpx.get(url, timeout=20, follow_redirects=True)  # no is_safe_url()
+        if resp.status_code == 200:
+            return resp.text
+    except httpx.HTTPError as exc:
+        logger.debug("UrlSource fetch failed for %s: %s", url, exc)
+        return None
+    return None
+```
+
+`_matches()` only checks:
+1. URL starts with `http://` or `https://`
+2. Path ends with `.md`
+
+So `http://169.254.169.254/latest/meta-data/iam/security-credentials/role.md` passes.
+
+#### Attack Scenario
+
+1. Attacker runs: `hermes skills install 'http://169.254.169.254/latest/meta-data/iam/security-credentials/role.md'`
+2. `UrlSource._matches()` returns True (URL ends in `.md`)
+3. `UrlSource._fetch_text()` calls `httpx.get()` to the AWS IMDS
+4. IAM credentials appear in error logs or install failure messages
+
+Alternative: redirect bypass via `http://attacker.com/redirect.md` → 301 to `http://169.254.169.254/...` (`follow_redirects=True` follows the chain without re-checking `is_safe_url()`).
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_urlsource_ssrf.py
+```
+
+**Result:** Localhost HTTP server is fetched directly, fake credential content returned and written to `/tmp/pwned_urlsource.txt`. No `is_safe_url()` invoked.
+
+#### Remediation
+
+1. Call `is_safe_url(url)` at the top of `UrlSource._fetch_text()` and return `None` if it fails
+2. Add an `_ssrf_redirect_guard` hook (as used in `vision_tools.py`) to re-validate each redirect target
+3. Consider restricting `UrlSource` to `https://` only (drops plaintext SSRF)
+
+---
+
 ## Additional Findings (Not Yet Confirmed)
 
-The following vulnerabilities were identified during code analysis but require further investigation:
+The following vulnerability was identified during code analysis but requires further investigation:
 
 1. **Webhook Auth Bypass** (`gateway/platforms/webhook.py:59,325`) - `INSECURE_NO_AUTH` sentinel bypasses HMAC verification (Low - requires config access)
-2. **API Server No-Auth on Localhost** (`gateway/platforms/api_server.py:2692-2697`) - Warning-only when no API key set (Low-Medium - local access only)
 
 ---
 
@@ -536,9 +642,10 @@ Hermes Agent contains multiple critical vulnerabilities across different attack 
 
 1. **Command Injection (HAG-001, HAG-002, HAG-003, HAG-009):** Consistent use of `shell=True` with unsanitized input, including env-var-controlled shell templates
 2. **SQL Injection (HAG-004):** Insufficient validation of user-supplied SQL in MCP template
-3. **SSRF (HAG-005):** Missing `is_safe_url()` checks in skill installation flow
+3. **SSRF (HAG-005, HAG-011):** Missing `is_safe_url()` checks in skill installation flow — both indirect (ClawHub metadata) and direct (user-supplied UrlSource URL)
 4. **File Disclosure (HAG-006):** No path restriction on local file reads in vision tool
 5. **Path Traversal (HAG-007, HAG-008):** Missing `..` component sanitisation in snapshot restore and file-sync sync-back
+6. **Authentication Bypass (HAG-010):** API server allows all requests when no key is configured, exposing cron jobs, agent execution, and response history to any local process
 
 **Immediate Actions Required:**
 1. Audit all `shell=True` usages and convert to `shell=False` with explicit argument lists
