@@ -8,49 +8,53 @@
 
 ---
 
-
 ## Executive Summary
 
-This audit identified **35 critical/high severity vulnerabilities** in Hermes Agent, combined into **18 end-to-end exploit chains** demonstrating real-world critical impact. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
+This audit identified **35 critical/high severity vulnerabilities** in Hermes Agent, combined into **18 end-to-end exploit chains** demonstrating real-world critical impact. All findings were validated with working proof-of-concept exploits against the audited codebase, using controlled attacker infrastructure where the scenario requires auxiliary services.
 
+## Evidence Types
 
-| ID | Vulnerability | Severity | CVSS | Status |
-|----|--------------|----------|------|--------|
-| HAG-001 | TUI Gateway shell.exec JSON-RPC Command Injection | Critical | 9.8 | Confirmed |
-| HAG-014 | Godmode exec() RCE via Attacker-Controlled HERMES_HOME | Critical | 9.8 | Confirmed |
-| HAG-009 | HERMES_LOCAL_STT_COMMAND Template Injection RCE | Critical | 9.3 | Confirmed |
-| HAG-013 | Project Plugin Auto-Load RCE via HERMES_ENABLE_PROJECT_PLUGINS | Critical | 9.3 | Confirmed |
-| HAG-027 | Gateway Hook Auto-load Arbitrary Python Execution | Critical | 9.3 | Confirmed |
-| HAG-002 | Plugin YAML Check Field Command Injection | Critical | 9.1 | Confirmed |
-| HAG-012 | TUI command.dispatch Quick-Command RCE (no dangerous-cmd check) | Critical | 9.1 | Confirmed |
-| HAG-015 | HERMES_GWS_BIN Arbitrary Binary Execution (No Validation) | Critical | 9.1 | Confirmed |
-| HAG-017 | HERMES_PYTHON Arbitrary Binary Execution (No Validation) | Critical | 9.1 | Confirmed |
-| HAG-024 | HERMES_TUI_DIR Arbitrary JavaScript Execution | Critical | 9.1 | Confirmed |
-| HAG-029 | HERMES_BIN Arbitrary Binary Execution (TUI externalCli.ts) | Critical | 9.1 | Confirmed |
-| HAG-030 | HERMES_COPILOT_ACP_COMMAND Arbitrary Binary Execution | Critical | 9.1 | Confirmed |
-| HAG-020 | HERMES_PREFILL_MESSAGES_FILE Context Injection Attack | Critical | 9.0 | Confirmed |
-| HAG-028 | TIRITH_BIN Arbitrary Binary Execution (No Validation) | High | 8.8 | Confirmed |
-| HAG-004 | MCP Database Template SQL Injection | High | 8.6 | Confirmed |
-| HAG-033 | MCP api_wrapper SSRF via API_BASE_URL — Token Leakage | High | 8.6 | Confirmed |
-| HAG-003 | Docker Cleanup HERMES_DOCKER_BINARY Injection | High | 8.4 | Confirmed |
-| HAG-019 | HERMES_CA_BUNDLE TLS MitM via Arbitrary CA Injection | High | 8.1 | Confirmed |
-| HAG-036 | base_client.py SSRF via BASE_RPC_URL Env Var | High | 8.1 | Confirmed |
-| HAG-007 | Snapshot Restore Manifest Path Traversal | High | 7.8 | Confirmed |
-| HAG-008 | FileSync sync-back Host Path Traversal | High | 7.8 | Confirmed |
-| HAG-016 | /api/plugins/* Routes Authentication Bypass | High | 7.8 | Confirmed |
-| HAG-021 | Session Token Exposure in HTML Response | High | 7.8 | Confirmed |
-| HAG-025 | Webhook INSECURE_NO_AUTH Bypass via Dynamic Routes | High | 7.8 | Confirmed |
-| HAG-035 | scaffold_fastmcp.py Arbitrary File Write via --output | High | 7.8 | Confirmed |
-| HAG-005 | ClawHub SSRF via rawUrl | High | 7.5 | Confirmed |
-| HAG-006 | Vision Tool Local File Disclosure | High | 7.5 | Confirmed |
-| HAG-010 | API Server Unauthenticated Local Access | High | 7.5 | Confirmed |
-| HAG-011 | UrlSource SSRF — Missing is_safe_url() Guard | High | 7.5 | Confirmed |
-| HAG-018 | Redaction Disabled by Default — API Key Leakage via Logs | High | 7.5 | Confirmed |
-| HAG-022 | WebSocket Missing Origin Validation (CSWSH) | High | 7.5 | Confirmed |
-| HAG-026 | MCP file_processor Unrestricted File Read | High | 7.5 | Confirmed |
-| HAG-031 | WeCom XML Pre-Auth Billion Laughs DoS | High | 7.5 | Confirmed |
-| HAG-034 | Canvas API SSRF via HTTP Link Header — Bearer Token Leakage | High | 7.5 | Confirmed |
-| HAG-023 | auth.json TOCTOU Permission Race | Medium | 6.5 | Confirmed |
+- **Real Hermes Path** — the exploit triggers the vulnerable Hermes code path directly.
+- **Real Hermes Path + Controlled Attacker Service** — the exploit triggers real Hermes code while using a controlled attacker-side service, file, binary, or helper component to complete the scenario.
+- **Controlled Reproduction** — the exploit validates the vulnerable behavior with a controlled reproduction of the exposed surface rather than the exact live Hermes implementation.
+
+| ID | Vulnerability | Severity | CVSS | Status | Evidence |
+|----|--------------|----------|------|--------|----------|
+| HAG-001 | TUI Gateway shell.exec JSON-RPC Command Injection | Critical | 9.8 | Confirmed | Real Hermes Path |
+| HAG-014 | Godmode exec() RCE via Attacker-Controlled HERMES_HOME | Critical | 9.8 | Confirmed | Real Hermes Path |
+| HAG-009 | HERMES_LOCAL_STT_COMMAND Template Injection RCE | Critical | 9.3 | Confirmed | Real Hermes Path |
+| HAG-013 | Project Plugin Auto-Load RCE via HERMES_ENABLE_PROJECT_PLUGINS | Critical | 9.3 | Confirmed | Real Hermes Path |
+| HAG-027 | Gateway Hook Auto-load Arbitrary Python Execution | Critical | 9.3 | Confirmed | Real Hermes Path |
+| HAG-002 | Plugin YAML Check Field Command Injection | Critical | 9.1 | Confirmed | Real Hermes Path |
+| HAG-012 | TUI command.dispatch Quick-Command RCE (no dangerous-cmd check) | Critical | 9.1 | Confirmed | Real Hermes Path |
+| HAG-015 | HERMES_GWS_BIN Arbitrary Binary Execution (No Validation) | Critical | 9.1 | Confirmed | Real Hermes Path + Controlled Attacker Service |
+| HAG-017 | HERMES_PYTHON Arbitrary Binary Execution (No Validation) | Critical | 9.1 | Confirmed | Real Hermes Path + Controlled Attacker Service |
+| HAG-024 | HERMES_TUI_DIR Arbitrary JavaScript Execution | Critical | 9.1 | Confirmed | Real Hermes Path |
+| HAG-029 | HERMES_BIN Arbitrary Binary Execution (TUI externalCli.ts) | Critical | 9.1 | Confirmed | Real Hermes Path + Controlled Attacker Service |
+| HAG-030 | HERMES_COPILOT_ACP_COMMAND Arbitrary Binary Execution | Critical | 9.1 | Confirmed | Real Hermes Path + Controlled Attacker Service |
+| HAG-020 | HERMES_PREFILL_MESSAGES_FILE Context Injection Attack | Critical | 9.0 | Confirmed | Real Hermes Path + Controlled Attacker Service |
+| HAG-028 | TIRITH_BIN Arbitrary Binary Execution (No Validation) | High | 8.8 | Confirmed | Real Hermes Path |
+| HAG-004 | MCP Database Template SQL Injection | High | 8.6 | Confirmed | Controlled Reproduction |
+| HAG-033 | MCP api_wrapper SSRF via API_BASE_URL — Token Leakage | High | 8.6 | Confirmed | Controlled Reproduction |
+| HAG-003 | Docker Cleanup HERMES_DOCKER_BINARY Injection | High | 8.4 | Confirmed | Real Hermes Path |
+| HAG-019 | HERMES_CA_BUNDLE TLS MitM via Arbitrary CA Injection | High | 8.1 | Confirmed | Real Hermes Path + Controlled Attacker Service |
+| HAG-036 | base_client.py SSRF via BASE_RPC_URL Env Var | High | 8.1 | Confirmed | Controlled Reproduction |
+| HAG-007 | Snapshot Restore Manifest Path Traversal | High | 7.8 | Confirmed | Real Hermes Path |
+| HAG-008 | FileSync sync-back Host Path Traversal | High | 7.8 | Confirmed | Real Hermes Path |
+| HAG-016 | /api/plugins/* Routes Authentication Bypass | High | 7.8 | Confirmed | Controlled Reproduction |
+| HAG-021 | Session Token Exposure in HTML Response | High | 7.8 | Confirmed | Controlled Reproduction |
+| HAG-025 | Webhook INSECURE_NO_AUTH Bypass via Dynamic Routes | High | 7.8 | Confirmed | Real Hermes Path + Controlled Attacker Service |
+| HAG-035 | scaffold_fastmcp.py Arbitrary File Write via --output | High | 7.8 | Confirmed | Controlled Reproduction |
+| HAG-005 | ClawHub SSRF via rawUrl | High | 7.5 | Confirmed | Real Hermes Path |
+| HAG-006 | Vision Tool Local File Disclosure | High | 7.5 | Confirmed | Real Hermes Path |
+| HAG-010 | API Server Unauthenticated Local Access | High | 7.5 | Confirmed | Real Hermes Path |
+| HAG-011 | UrlSource SSRF — Missing is_safe_url() Guard | High | 7.5 | Confirmed | Real Hermes Path |
+| HAG-018 | Redaction Disabled by Default — API Key Leakage via Logs | High | 7.5 | Confirmed | Real Hermes Path |
+| HAG-022 | WebSocket Missing Origin Validation (CSWSH) | High | 7.5 | Confirmed | Controlled Reproduction |
+| HAG-026 | MCP file_processor Unrestricted File Read | High | 7.5 | Confirmed | Controlled Reproduction |
+| HAG-031 | WeCom XML Pre-Auth Billion Laughs DoS | High | 7.5 | Confirmed | Controlled Reproduction |
+| HAG-034 | Canvas API SSRF via HTTP Link Header — Bearer Token Leakage | High | 7.5 | Confirmed | Controlled Reproduction |
+| HAG-023 | auth.json TOCTOU Permission Race | Medium | 6.5 | Confirmed | Controlled Reproduction |
 
 ---
 
@@ -59,6 +63,29 @@ This audit identified **35 critical/high severity vulnerabilities** in Hermes Ag
 The following end-to-end chains combine multiple vulnerabilities into realistic
 attack scenarios, demonstrating that the individual findings are not theoretical
 --- they chain together to produce critical, reproducible impact.
+
+### Chain Evidence Matrix
+
+| Chain | Script | Evidence |
+|------|--------|----------|
+| 1 | `chain_browser_to_shell.py` | Controlled Reproduction |
+| 2 | `chain_clone_and_pwn.py` | Real Hermes Path |
+| 3 | `chain_skill_supply_chain.py` | Real Hermes Path |
+| 4 | `chain_plugin_to_secrets.py` | Controlled Reproduction |
+| 5 | `chain_ssrf_to_rce.py` | Real Hermes Path |
+| 6 | `chain_tls_mitm_to_injection.py` | Real Hermes Path + Controlled Attacker Service |
+| 7 | `chain_webhook_to_rce.py` | Real Hermes Path + Controlled Attacker Service |
+| 8 | `chain_vision_to_secrets.py` | Real Hermes Path + Controlled Attacker Service |
+| 9 | `chain_scaffold_to_hook.py` | Real Hermes Path + Controlled Attacker Service |
+| 10 | `chain_sandbox_escape.py` | Real Hermes Path + Controlled Attacker Service |
+| 11 | `chain_api_to_sqli.py` | Controlled Reproduction |
+| 12 | `chain_tui_full_compromise.py` | Real Hermes Path + Controlled Attacker Service |
+| 13 | `chain_docker_snapshot.py` | Real Hermes Path |
+| 14 | `chain_clawhub_stt.py` | Real Hermes Path |
+| 15 | `chain_gws_tirith.py` | Real Hermes Path + Controlled Attacker Service |
+| 16 | `chain_multi_ssrf.py` | Controlled Reproduction |
+| 17 | `chain_binary_hijack.py` | Real Hermes Path + Controlled Attacker Service |
+| 18 | `chain_dos_auth_race.py` | Controlled Reproduction |
 
 ### Chain 1: Browser-to-Shell (HAG-021 + HAG-022)
 
