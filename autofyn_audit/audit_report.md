@@ -4,13 +4,13 @@
 **Target:** Hermes Agent (https://github.com/NousResearch/hermes-agent)  
 **Commit:** 124da27  
 **Date:** 2026-04-28  
-**Status:** Round 5 - 14 Critical/High Vulnerabilities Confirmed
+**Status:** Round 6 - 17 Critical/High Vulnerabilities Confirmed
 
 ---
 
 ## Executive Summary
 
-This audit identified **14 critical/high severity vulnerabilities** in Hermes Agent. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
+This audit identified **17 critical/high severity vulnerabilities** in Hermes Agent. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
 
 | ID | Vulnerability | Severity | CVSS | Status |
 |----|--------------|----------|------|--------|
@@ -28,6 +28,9 @@ This audit identified **14 critical/high severity vulnerabilities** in Hermes Ag
 | HAG-012 | TUI command.dispatch Quick-Command RCE (no dangerous-cmd check) | Critical | 9.1 | Confirmed |
 | HAG-013 | Project Plugin Auto-Load RCE via HERMES_ENABLE_PROJECT_PLUGINS | Critical | 9.3 | Confirmed |
 | HAG-014 | Godmode exec() RCE via Attacker-Controlled HERMES_HOME | Critical | 9.8 | Confirmed |
+| HAG-015 | HERMES_GWS_BIN Arbitrary Binary Execution (No Validation) | Critical | 9.1 | Confirmed |
+| HAG-016 | /api/plugins/* Routes Authentication Bypass | High | 7.8 | Confirmed |
+| HAG-017 | HERMES_PYTHON Arbitrary Binary Execution (No Validation) | Critical | 9.1 | Confirmed |
 
 ---
 
@@ -387,6 +390,9 @@ autofyn_audit/
     exploit_ws_command_dispatch.py             # HAG-012 PoC
     exploit_project_plugin_rce.py              # HAG-013 PoC
     exploit_godmode_exec.py                    # HAG-014 PoC
+    exploit_gws_binary.py                      # HAG-015 PoC
+    exploit_plugin_auth_bypass.py              # HAG-016 PoC
+    exploit_hermes_python.py                   # HAG-017 PoC
   payloads/
     evil_plugin.yaml                            # Malicious plugin payload
   results/
@@ -807,6 +813,173 @@ python3 exploits/exploit_godmode_exec.py
 
 ---
 
+### HAG-015: HERMES_GWS_BIN Arbitrary Binary Execution (No Validation)
+
+**Severity:** Critical (CVSS 9.1)
+**File:** `skills/productivity/google-workspace/scripts/google_api.py:82-113`
+**Attack Vector:** Local (environment variable — process environment or `.env` file)
+
+#### Description
+
+The `_gws_binary()` function reads `HERMES_GWS_BIN` from the environment and returns it directly without any validation — no `os.path.isfile()`, no `os.access()` check. This value becomes `cmd[0]` in `subprocess.run()` at line 108.
+
+Compare this to `HERMES_NODE` which has explicit `isfile()`/`isexec()` guards. `HERMES_GWS_BIN` has zero validation, so any attacker-controlled environment variable value is executed as the Google Workspace binary.
+
+#### Vulnerable Code
+
+```python
+# google_api.py:82-86
+def _gws_binary() -> str:
+    configured = os.getenv("HERMES_GWS_BIN", "").strip()
+    if configured:
+        return configured  # No isfile(), no isexec() — returned verbatim
+
+# google_api.py:108
+def _run_gws(parts: list[str], ...) -> subprocess.CompletedProcess:
+    cmd = [_gws_binary()] + parts
+    return subprocess.run(cmd, ...)  # Executes attacker binary
+```
+
+#### Attack Scenario
+
+1. Attacker sets `HERMES_GWS_BIN=/tmp/pwn.sh` in the environment
+2. Any Google Workspace skill call (15+ functions) triggers `_run_gws()`
+3. Malicious binary executes with the Hermes process privileges
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_gws_binary.py
+```
+
+**Result:** Creates `/tmp/pwned_gws.txt` containing `uid=1000(agentuser)...`
+
+#### Remediation
+
+1. Add `os.path.isfile()` and `os.access(..., os.X_OK)` checks before returning `HERMES_GWS_BIN`
+2. Validate the path is under a trusted directory (e.g., `/usr/local/bin/`, `~/.hermes/bin/`)
+3. Consider removing env var override entirely and hardcoding a fixed path
+
+---
+
+### HAG-016: /api/plugins/* Routes Authentication Bypass
+
+**Severity:** High (CVSS 7.8)
+**File:** `hermes_cli/web_server.py:227`
+**Attack Vector:** Local (any process on the same machine)
+
+#### Description
+
+The `auth_middleware` explicitly exempts all routes starting with `/api/plugins/` from session token validation via this condition:
+
+```python
+if path.startswith("/api/") and path not in _PUBLIC_API_PATHS
+        and not path.startswith("/api/plugins/"):
+```
+
+Plugin routers are mounted at `/api/plugins/<name>/` (line 3114). Any plugin API endpoint is accessible without authentication to any local process. This defeats the session token protection for plugin routes.
+
+#### Vulnerable Code
+
+```python
+# web_server.py:227
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+    if (
+        path.startswith("/api/")
+        and path not in _PUBLIC_API_PATHS
+        and not path.startswith("/api/plugins/")  # VULN: all plugins bypass auth
+    ):
+        if not _has_valid_session_token(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    return await call_next(request)
+```
+
+#### Attack Scenario
+
+1. User runs `hermes web` which starts the web server with plugins
+2. Any local process (browser JavaScript, malicious extension, another user) accesses `http://127.0.0.1:9119/api/plugins/<name>/`
+3. Plugin API endpoints respond without requiring session token
+4. Attacker reads sensitive data or triggers side effects via plugin routes
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_plugin_auth_bypass.py
+```
+
+**Result:** `/api/settings/` returns HTTP 401 (control), `/api/plugins/evil/` returns HTTP 200 (bypass confirmed)
+
+#### Remediation
+
+1. Remove the `not path.startswith("/api/plugins/")` exception from `auth_middleware`
+2. If specific plugin routes should be public, add them to `_PUBLIC_API_PATHS` explicitly
+3. Consider requiring authentication for ALL `/api/` routes by default
+
+---
+
+### HAG-017: HERMES_PYTHON Arbitrary Binary Execution (No Validation)
+
+**Severity:** Critical (CVSS 9.1)
+**File:** `ui-tui/src/gatewayClient.ts:21,124`
+**Attack Vector:** Local (environment variable — process environment or `.env` file)
+
+#### Description
+
+The `resolvePython()` function in `gatewayClient.ts` reads `HERMES_PYTHON` from the environment and returns it directly without validation:
+
+```typescript
+const configured = process.env.HERMES_PYTHON?.trim() || process.env.PYTHON?.trim()
+if (configured) {
+  return configured  // No existsSync(), no which(), no validation
+}
+```
+
+This value is passed directly to `spawn()` at line 124. Any binary path is accepted and executed. While `hermes_cli/main.py:1117` sets a default via `env.setdefault()`, a pre-existing env var value is always honored.
+
+#### Vulnerable Code
+
+```typescript
+// gatewayClient.ts:20-24
+function resolvePython(): string {
+  const configured = process.env.HERMES_PYTHON?.trim() || process.env.PYTHON?.trim()
+  if (configured) {
+    return configured  // VULN: no fs.existsSync(), no validation
+  }
+  // ... fallback logic
+}
+
+// gatewayClient.ts:124
+this.proc = spawn(python, ['-m', 'tui_gateway.entry'], { cwd, env, ... })
+```
+
+#### Attack Scenario
+
+1. Attacker sets `HERMES_PYTHON=/tmp/backdoor` before `hermes tui` runs
+2. TUI startup calls `resolvePython()` which returns the attacker path
+3. `spawn()` executes `/tmp/backdoor -m tui_gateway.entry`
+4. Malicious binary runs with the user's privileges (ignores the `-m` arguments)
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_hermes_python.py
+```
+
+**Result:** Creates `/tmp/pwned_hermes_python.txt` containing `uid=1000(agentuser)...`
+
+#### Remediation
+
+1. Add `fs.existsSync()` and verify the file is executable before returning `HERMES_PYTHON`
+2. Validate the path points to a real Python interpreter (check for `--version` output)
+3. Consider removing the env var override and using only the detected Python from venv/system
+
+---
+
 ## Additional Findings (Not Yet Confirmed)
 
 The following vulnerability was identified during code analysis but requires further investigation:
@@ -824,9 +997,10 @@ Hermes Agent contains multiple critical vulnerabilities across different attack 
 3. **SSRF (HAG-005, HAG-011):** Missing `is_safe_url()` checks in skill installation flow — both indirect (ClawHub metadata) and direct (user-supplied UrlSource URL)
 4. **File Disclosure (HAG-006):** No path restriction on local file reads in vision tool
 5. **Path Traversal (HAG-007, HAG-008):** Missing `..` component sanitisation in snapshot restore and file-sync sync-back
-6. **Authentication Bypass (HAG-010):** API server allows all requests when no key is configured, exposing cron jobs, agent execution, and response history to any local process
+6. **Authentication Bypass (HAG-010, HAG-016):** API server allows all requests when no key is configured; `/api/plugins/*` routes explicitly bypass session token validation
 7. **Unsafe Plugin Loading (HAG-013):** Project plugins loaded from CWD with no integrity check, enabling malicious Git repository attacks
 8. **Arbitrary exec() via env var (HAG-014):** `HERMES_HOME` controls which Python files are exec()-loaded by `load_godmode`, with no hash or signature verification
+9. **Env Var Binary Injection (HAG-015, HAG-017):** `HERMES_GWS_BIN` and `HERMES_PYTHON` env vars flow directly to subprocess/spawn with no path validation
 
 **Immediate Actions Required:**
 1. Audit all `shell=True` usages and convert to `shell=False` with explicit argument lists
@@ -840,6 +1014,8 @@ Hermes Agent contains multiple critical vulnerabilities across different attack 
 9. Sanitise all manifest/metadata-derived file paths through `Path.resolve()` and containment checks before any file write operation
 10. Replace env-var-driven exec() paths with integrity-checked loaders; derive script paths from `__file__`, not user-supplied env vars
 11. Require user confirmation and hash verification before auto-loading project plugins
+12. Apply `isfile()`/`isexec()` validation to all env-var-configured binary paths (HERMES_GWS_BIN, HERMES_PYTHON, etc.)
+13. Remove the `/api/plugins/*` exception from `auth_middleware` — require session token for ALL plugin routes
 
 ---
 
