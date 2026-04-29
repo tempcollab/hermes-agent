@@ -4,13 +4,13 @@
 **Target:** Hermes Agent (https://github.com/NousResearch/hermes-agent)  
 **Commit:** 124da27  
 **Date:** 2026-04-28  
-**Status:** Round 8 - 23 Critical/High Vulnerabilities Confirmed
+**Status:** Round 9 - 26 Critical/High Vulnerabilities Confirmed
 
 ---
 
 ## Executive Summary
 
-This audit identified **23 critical/high severity vulnerabilities** in Hermes Agent. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
+This audit identified **26 critical/high severity vulnerabilities** in Hermes Agent. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
 
 | ID | Vulnerability | Severity | CVSS | Status |
 |----|--------------|----------|------|--------|
@@ -37,6 +37,9 @@ This audit identified **23 critical/high severity vulnerabilities** in Hermes Ag
 | HAG-021 | Session Token Exposure in HTML Response | High | 7.8 | Confirmed |
 | HAG-022 | WebSocket Missing Origin Validation (CSWSH) | High | 7.5 | Confirmed |
 | HAG-023 | auth.json TOCTOU Permission Race | Medium | 6.5 | Confirmed |
+| HAG-024 | HERMES_TUI_DIR Arbitrary JavaScript Execution | Critical | 9.1 | Confirmed |
+| HAG-025 | Webhook INSECURE_NO_AUTH Bypass via Dynamic Routes | High | 7.8 | Confirmed |
+| HAG-026 | MCP file_processor Unrestricted File Read | High | 7.5 | Confirmed |
 
 ---
 
@@ -1367,6 +1370,115 @@ Hermes Agent contains multiple critical vulnerabilities across different attack 
 14. Enable credential redaction by default (`_REDACT_ENABLED = True`) or emit a prominent startup warning when disabled
 15. Validate `HERMES_CA_BUNDLE` against ownership, permissions, and trusted directory constraints before trusting it for TLS
 16. Enforce role allowlist (`["user", "assistant"]`) and content length limits in `_load_prefill_messages()`
+17. Derive TUI directory from `__file__` or a hardcoded repo-relative path; verify `dist/entry.js` against a SHA-256 hash when `HERMES_TUI_DIR` overrides the bundled TUI
+18. Reject dynamic webhook routes with `secret == "INSECURE_NO_AUTH"` in `_reload_dynamic_routes()`; allow the sentinel only in static config.yaml routes
+19. Add path containment in `_read_text()` using `Path.resolve()` against a safe base directory; call `validate_within_dir()` from `path_security.py`
+
+---
+
+### HAG-024: HERMES_TUI_DIR Arbitrary JavaScript Execution
+
+**Severity:** Critical (CVSS 9.1)
+**File:** `hermes_cli/main.py:1026-1031`
+**Attack Vector:** Local (environment variable)
+
+#### Description
+
+`_make_tui_argv()` reads `HERMES_TUI_DIR` from the environment and, when the
+directory contains a valid-looking `dist/entry.js` and node_modules is
+satisfied, returns `[node, str(p / "dist" / "entry.js")]` without any
+integrity check on the JS file. An attacker who controls this env var before
+TUI launch executes arbitrary JavaScript as the TUI process.
+
+#### Vulnerable Code
+
+```python
+ext_dir = os.environ.get("HERMES_TUI_DIR")
+if ext_dir:
+    p = Path(ext_dir)
+    if (p / "dist" / "entry.js").exists() and not _tui_need_npm_install(p):
+        node = _node_bin("node")
+        return [node, str(p / "dist" / "entry.js")], p  # attacker-controlled JS
+```
+
+#### Remediation
+
+1. Derive TUI directory from `__file__` or hardcoded repo-relative path
+2. Verify `dist/entry.js` content against a SHA-256 hash before executing
+3. Emit a prominent warning when `HERMES_TUI_DIR` overrides the bundled TUI
+
+---
+
+### HAG-025: Webhook INSECURE_NO_AUTH Bypass via Dynamic Routes
+
+**Severity:** High (CVSS 7.8)
+**File:** `gateway/platforms/webhook.py:59, 262-293, 323-325`
+**Attack Vector:** Local file write + HTTP POST
+
+#### Description
+
+The `INSECURE_NO_AUTH` sentinel is intended for development-only use in static
+config.yaml routes. However, `_reload_dynamic_routes()` loads
+`~/.hermes/webhook_subscriptions.json` on every POST without validating secret
+values. An agent or any process with write access to HERMES_HOME can inject a
+route with `secret="INSECURE_NO_AUTH"`, causing the auth check at line 325 to
+evaluate to False and silently bypass HMAC signature verification.
+
+#### Vulnerable Code
+
+```python
+secret = route_config.get("secret", self._global_secret)
+if secret and secret != _INSECURE_NO_AUTH:  # bypass when secret == "INSECURE_NO_AUTH"
+    if not self._validate_signature(request, raw_body, secret):
+        return web.json_response({"error": "Invalid signature"}, status=401)
+```
+
+#### Remediation
+
+1. In `_reload_dynamic_routes()`, reject any route with `secret == "INSECURE_NO_AUTH"`
+2. Apply the same validation during startup `connect()` for dynamic routes
+3. Make `INSECURE_NO_AUTH` valid only in static routes (config.yaml), never in agent-written JSON
+
+---
+
+### HAG-026: MCP file_processor Unrestricted File Read
+
+**Severity:** High (CVSS 7.5)
+**File:** `optional-skills/mcp/fastmcp/templates/file_processor.py:12-51`
+**Attack Vector:** MCP tool client
+
+#### Description
+
+The `_read_text()` helper and the `read_file_resource()` MCP resource endpoint
+accept arbitrary path strings, call `Path(path).expanduser()`, and read the
+resulting file without any directory containment check. This allows any MCP
+client to read `/etc/passwd`, `~/.ssh/id_rsa`, or any other file readable by
+the agent process. Tilde expansion via `expanduser()` additionally exposes the
+user's home directory tree.
+
+#### Vulnerable Code
+
+```python
+def _read_text(path: str) -> str:
+    file_path = Path(path).expanduser()  # tilde expansion, no containment
+    return file_path.read_text(encoding="utf-8")  # reads any file
+
+@mcp.resource("file://{path}")
+def read_file_resource(path: str) -> str:
+    return _read_text(path)  # no path restriction
+```
+
+#### Remediation
+
+1. Add path containment in `_read_text()`:
+   ```python
+   safe_base = Path.home() / "mcp-data"
+   resolved = Path(path).expanduser().resolve()
+   if not str(resolved).startswith(str(safe_base)):
+       raise ValueError(f"Access denied: {path}")
+   ```
+2. Use `validate_within_dir()` from `path_security.py`
+3. Expose only specific named files or a restricted base directory
 
 ---
 
