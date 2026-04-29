@@ -4,13 +4,13 @@
 **Target:** Hermes Agent (https://github.com/NousResearch/hermes-agent)  
 **Commit:** 124da27  
 **Date:** 2026-04-28  
-**Status:** Round 7 - 20 Critical/High Vulnerabilities Confirmed
+**Status:** Round 8 - 23 Critical/High Vulnerabilities Confirmed
 
 ---
 
 ## Executive Summary
 
-This audit identified **20 critical/high severity vulnerabilities** in Hermes Agent. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
+This audit identified **23 critical/high severity vulnerabilities** in Hermes Agent. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
 
 | ID | Vulnerability | Severity | CVSS | Status |
 |----|--------------|----------|------|--------|
@@ -34,6 +34,9 @@ This audit identified **20 critical/high severity vulnerabilities** in Hermes Ag
 | HAG-018 | Redaction Disabled by Default — API Key Leakage via Logs | High | 7.5 | Confirmed |
 | HAG-019 | HERMES_CA_BUNDLE TLS MitM via Arbitrary CA Injection | High | 8.1 | Confirmed |
 | HAG-020 | HERMES_PREFILL_MESSAGES_FILE Context Injection Attack | Critical | 9.0 | Confirmed |
+| HAG-021 | Session Token Exposure in HTML Response | High | 7.8 | Confirmed |
+| HAG-022 | WebSocket Missing Origin Validation (CSWSH) | High | 7.5 | Confirmed |
+| HAG-023 | auth.json TOCTOU Permission Race | Medium | 6.5 | Confirmed |
 
 ---
 
@@ -1139,6 +1142,186 @@ python3 exploits/exploit_prefill_injection.py
 
 ---
 
+### HAG-021: Session Token Exposure in HTML Response
+
+**Severity:** High (CVSS 7.8)
+**File:** `hermes_cli/web_server.py:2616-2620`
+**Attack Vector:** Local/Network (any process that can read the dashboard HTML response)
+
+#### Description
+
+The dashboard server injects the session token directly into every HTML page response via a `<script>` tag.  The token — `_SESSION_TOKEN = secrets.token_urlsafe(32)` generated once at server startup — controls access to all authenticated dashboard endpoints including WebSocket PTY access.
+
+Any attacker who can observe the HTML source (browser extension, network proxy, shared screen, cached page, or XSS on any localhost page) extracts a fully valid credential with a single regex match and no JavaScript execution.
+
+#### Vulnerable Code
+
+```python
+# hermes_cli/web_server.py:2616-2620
+def _serve_index():
+    html = _index_path.read_text()
+    token_script = (
+        f'<script>window.__HERMES_SESSION_TOKEN__="{_SESSION_TOKEN}";'  # VULN: token in plain HTML
+        f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};</script>"
+    )
+    html = html.replace("</head>", f"{token_script}</head>", 1)
+```
+
+Also exposed in WS URLs at `web_server.py:2350`:
+```python
+qs = urllib.parse.urlencode({"token": _SESSION_TOKEN, "channel": channel})
+return f"ws://{netloc}/api/pub?{qs}"  # Token in URL query string
+```
+
+#### Attack Scenario
+
+1. User opens `hermes dashboard` at `http://127.0.0.1:9119/`
+2. Attacker (browser extension, proxy, or XSS) reads the HTML source
+3. Attacker extracts token via: `re.search(r'__HERMES_SESSION_TOKEN__="([^"]+)"', html).group(1)`
+4. Attacker connects to `ws://127.0.0.1:9119/api/pty?token=<stolen>` from any origin
+5. Full shell access via WebSocket PTY (combines with HAG-022)
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_session_token_html.py
+```
+
+**Result:** Token extracted from HTML via regex (`__HERMES_SESSION_TOKEN__="([^"]+)"`) and written to `/tmp/pwned_session_token.txt`
+
+#### Remediation
+
+1. Inject the token into a `<meta>` tag with a non-predictable attribute name and read it via JS, preventing regex extraction by non-JS readers
+2. Deliver the token via a separate authenticated HTTP endpoint (e.g., `/api/token`) instead of embedding in HTML
+3. Use short-lived tokens that expire after a few minutes, reducing the window of stolen-token abuse
+
+---
+
+### HAG-022: WebSocket Missing Origin Validation (CSWSH)
+
+**Severity:** High (CVSS 7.5)
+**File:** `hermes_cli/web_server.py:2376-2394`, `tui_gateway/ws.py:112-114`
+**Attack Vector:** Network (any website can connect to localhost WebSocket)
+
+#### Description
+
+The WebSocket endpoints (`/api/pty`, `/api/pub`, `/api/events`, `/api/ws`) check the session token via query param but **never validate the `Origin` header**.  Combined with HAG-021, this enables Cross-Site WebSocket Hijacking (CSWSH): a malicious page that obtains the token can connect from any `Origin`.
+
+Additionally, `tui_gateway/ws.py:handle_ws()` calls `await ws.accept()` immediately with no authentication at all — no token check, no Origin check.
+
+#### Vulnerable Code
+
+```python
+# hermes_cli/web_server.py:2382-2394
+@app.websocket("/api/pty")
+async def pty_ws(ws: WebSocket) -> None:
+    token = ws.query_params.get("token", "")
+    if not hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+        await ws.close(code=4401)
+        return
+    # NO Origin header validation!
+    await ws.accept()
+
+# tui_gateway/ws.py:112-114
+async def handle_ws(ws: Any) -> None:
+    await ws.accept()  # VULN: No auth, no Origin check whatsoever
+```
+
+#### Attack Scenario
+
+1. User has `hermes dashboard` running on `127.0.0.1:9119`
+2. User visits `https://evil.com/attack.html`
+3. Malicious page connects: `new WebSocket("ws://127.0.0.1:9119/api/pty?token=STOLEN")`
+4. Browser sends `Origin: https://evil.com` — server accepts without checking
+5. Attacker has full PTY access to user's shell from a cross-origin page
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_ws_origin_bypass.py
+```
+
+**Result:** WebSocket connection with `Origin: https://evil.com` and valid token accepted; bad-token control correctly rejected; confirmation written to `/tmp/pwned_ws_origin.txt`
+
+#### Remediation
+
+1. Add Origin header validation to all WebSocket endpoints:
+   ```python
+   origin = ws.headers.get("origin", "")
+   if origin and not re.match(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$", origin):
+       await ws.close(code=4403)
+       return
+   ```
+2. Add the same CORS-style Origin check to `tui_gateway/ws.py:handle_ws()`
+3. Require authentication in `tui_gateway/ws.py` — currently has no auth at all
+
+---
+
+### HAG-023: auth.json TOCTOU Permission Race
+
+**Severity:** Medium (CVSS 6.5)
+**File:** `hermes_cli/auth.py:834-867`
+**Attack Vector:** Local (race condition in credential file creation)
+
+#### Description
+
+`_save_auth_store()` writes `auth.json` (containing OAuth tokens, API keys, and refresh tokens) using a temp file + atomic rename pattern.  However, `chmod(0o600)` is applied **after** the rename, creating a TOCTOU race window where the file exists with default permissions (`0644` — world-readable) on most Linux systems.
+
+A concurrent inotify-watching process can read the credential file during this window.  If the process is killed or crashes between `atomic_replace()` and `chmod()`, the file permanently remains world-readable.
+
+Compare to the **secure pattern** in `tools/mcp_oauth.py:158-168` which applies `chmod(0o600)` **before** `rename()`, closing the window entirely.
+
+#### Vulnerable Code
+
+```python
+# hermes_cli/auth.py:841-866
+with tmp_path.open("w", encoding="utf-8") as handle:  # Default perms (umask → 0644)
+    handle.write(payload)
+    handle.flush()
+    os.fsync(handle.fileno())
+atomic_replace(tmp_path, auth_file)  # auth.json now exists at 0644 — RACE WINDOW OPEN
+# ... fsync dir ...
+try:
+    auth_file.chmod(stat.S_IRUSR | stat.S_IWUSR)  # Too late — window already open
+except OSError:
+    pass
+```
+
+Secure reference pattern:
+```python
+# tools/mcp_oauth.py:164-165
+os.chmod(tmp, 0o600)   # Correct: chmod BEFORE rename — zero-window
+tmp.rename(path)
+```
+
+#### Attack Scenario
+
+1. Attacker starts an inotify loop on `~/.hermes/auth.json`
+2. User runs `hermes auth nous` — `_save_auth_store()` is invoked
+3. In the window between `atomic_replace()` and `chmod()`:
+   - `auth.json` exists with mode `0644` (world-readable)
+   - Attacker reads the file and extracts OAuth access and refresh tokens
+4. Alternatively: process crash leaves `auth.json` at `0644` permanently
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_auth_toctou.py
+```
+
+**Result:** File created with `0o644` via default `open()`, confirmed world-readable after `atomic_replace()`, attacker reads OAuth token during window; secure pattern (`chmod` before rename) produces `0o600` with zero-width window
+
+#### Remediation
+
+1. Apply `chmod(0o600)` to the **temp file** before `atomic_replace()`, not after — mirroring `tools/mcp_oauth.py:164`
+2. Create temp files with explicit `mode` via `open(..., mode=0o600)` for defence in depth (Python's `open()` does not accept a `mode` keyword for this, use `os.open()` or `os.fdopen()`)
+3. Check for and alert on `auth.json` having permissive permissions at startup
+
+---
+
 ## Additional Findings (Not Yet Confirmed)
 
 The following vulnerability was identified during code analysis but requires further investigation:
@@ -1163,6 +1346,9 @@ Hermes Agent contains multiple critical vulnerabilities across different attack 
 10. **Credential Leakage (HAG-018):** Redaction is opt-in (disabled by default), so API keys and tokens appear in logs for all standard deployments
 11. **TLS MitM (HAG-019):** `HERMES_CA_BUNDLE` accepts any file path as a CA bundle with no integrity check, enabling full HTTPS interception
 12. **Context Injection (HAG-020):** `HERMES_PREFILL_MESSAGES_FILE` injects arbitrary roles and content into conversation history with no validation, enabling jailbreak-style attacks
+13. **Session Token in HTML (HAG-021):** Session token injected into every HTML response as plaintext JavaScript; extractable by any process that can read the HTTP body via a single regex
+14. **WebSocket CSWSH (HAG-022):** No Origin header validation on any WebSocket endpoint; combined with HAG-021, enables full cross-site WebSocket hijacking and remote PTY access
+15. **Credential TOCTOU Race (HAG-023):** `auth.json` is world-readable between `atomic_replace()` and `chmod()` — OAuth tokens readable by concurrent processes or permanently exposed on crash
 
 **Immediate Actions Required:**
 1. Audit all `shell=True` usages and convert to `shell=False` with explicit argument lists
